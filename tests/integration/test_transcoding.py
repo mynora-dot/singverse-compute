@@ -172,6 +172,43 @@ class TranscodingHttpTest(unittest.TestCase):
                 str(self.root/'cache'/identifier/f'stream_{name}.m3u8')]))['streams'][0]
             self.assertEqual(audio['codec_name'], 'aac')
 
+    def test_android5_mpegts_retains_karaoke_tracks_and_independent_stereo_channels(self):
+        import array
+        import math
+        source = self.root/'media'/'android5-stereo.mkv'
+        subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','testsrc2=s=160x90:r=25:d=2',
+                        '-f','lavfi','-i','aevalsrc=sin(2*PI*400*t)|sin(2*PI*800*t):s=48000:d=2',
+                        '-f','lavfi','-i','aevalsrc=sin(2*PI*1000*t)|sin(2*PI*1600*t):s=48000:d=2',
+                        '-map','0:v','-map','1:a','-map','2:a','-c:v','mpeg4','-c:a','pcm_s16le',
+                        '-metadata:s:a:0','title=原唱','-metadata:s:a:1','title=伴奏',str(source)],check=True)
+        identifier = str(uuid.uuid4())
+        self.request('/executions',{'id':identifier,'path':str(source),'fingerprint':'android5-stereo',
+                     'target':{'mode':'TRANSCODE','codec':'h264','profile':'baseline','level':31,
+                               'width':1280,'height':720,'fps':30,'bitrate':4000000,'fmp4':False,'max_channels':2}})
+        result = self.wait(identifier)
+        self.assertEqual(result['state'],'SUCCEEDED',result)
+        audios = [track for track in result['trackMapping'] if track['kind']=='audio']
+        self.assertEqual([track['title'] for track in audios],['原唱','伴奏'])
+        self.assertEqual([track['sourceId'] for track in audios],['stream:1','stream:2'])
+        self.assertEqual([track['channels'] for track in audios],[2,2])
+        directory = self.root/'cache'/identifier
+        self.assertTrue(list(directory.glob('*.ts')))
+        self.assertFalse(list(directory.glob('*.m4s')))
+        for index, frequencies in enumerate(((400,800),(1000,1600))):
+            playlist = directory/f'stream_audio{index}.m3u8'
+            probe = json.loads(subprocess.check_output(['ffprobe','-v','error','-select_streams','a:0',
+                '-show_entries','stream=codec_name,profile,channels','-of','json',str(playlist)]))['streams'][0]
+            self.assertEqual((probe['codec_name'],probe['profile'],probe['channels']),('aac','LC',2))
+            samples = array.array('f',subprocess.check_output(['ffmpeg','-v','error','-i',str(playlist),
+                '-t','1','-ar','8000','-ac','2','-f','f32le','-']))
+            def energy(channel, frequency):
+                values = samples[channel::2]
+                real = sum(value*math.cos(2*math.pi*frequency*n/8000) for n,value in enumerate(values))
+                imaginary = sum(value*math.sin(2*math.pi*frequency*n/8000) for n,value in enumerate(values))
+                return real*real+imaginary*imaginary
+            self.assertGreater(energy(0,frequencies[0]),10*energy(0,frequencies[1]))
+            self.assertGreater(energy(1,frequencies[1]),10*energy(1,frequencies[0]))
+
     def test_hls_and_offline_multi_audio_readonly(self):
         for purpose in ['REALTIME','OFFLINE']:
             identifier,body=self.create(purpose)

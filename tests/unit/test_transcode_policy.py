@@ -3,6 +3,22 @@ import unittest
 from singverse_compute.domain.transcoding import Client, Media, Stream, decide
 
 class PlaybackPolicyTest(unittest.TestCase):
+    def test_android5_profile_keeps_supported_media_direct_and_transcodes_only_unsupported_parts(self):
+        client = Client(family='android-tv', containers=('mp4','ts','mp3','wav'), video=('h264',),
+                        audio=('aac','mp3','pcm_s16le'), max_width=1280, max_height=720,
+                        max_fps=30, max_bitrate=4000000, max_channels=2, max_bit_depth=8,
+                        profiles={'h264':('Baseline',)}, levels={'h264':31}, fmp4=False)
+        video = Stream('stream:0',0,'video','h264',profile='Constrained Baseline',level=31,width=1280,height=720,fps=30)
+        audio = Stream('stream:1',1,'audio','aac',channels=2)
+        media = Media('mp4',120,3000000,(video,audio))
+        self.assertEqual(decide(media,client).mode,'DIRECT')
+        self.assertEqual(decide(replace(media,container='mkv'),client).mode,'REMUX')
+        self.assertEqual(decide(replace(media,streams=(video,replace(audio,codec='dts',channels=6))),client).mode,'AUDIO_TRANSCODE')
+        for modified in (replace(video,codec='hevc'), replace(video,width=1920,height=1080),
+                         replace(video,profile='High'), replace(video,level=40), replace(video,bit_depth=10)):
+            with self.subTest(video=modified):
+                self.assertEqual(decide(replace(media,streams=(modified,audio)),client).mode,'TRANSCODE')
+
     def test_constrained_profiles_use_parent_support_only_in_the_safe_direction(self):
         for actual, supported, direct in [('Constrained Baseline','Baseline',True), ('Baseline','Constrained Baseline',False),
                                            ('Constrained High','High',True), ('High','Constrained High',False)]:

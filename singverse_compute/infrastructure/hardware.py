@@ -49,6 +49,24 @@ def accelerators():
     return {'audio': sorted(audio), 'video': sorted(video)}
 
 
+def separation_accelerators():
+    """Physical candidates only; runtime discovery and qualification stay separate."""
+    physical = set(accelerators()['audio'])
+    candidates = set()
+    for family, backends in (
+        ('cuda', ('cuda', 'tensorrt')),
+        ('rocm', ('migraphx',)),
+        ('openvino', ('openvino',)),
+        ('mps', ('coreml', 'mlx')),
+        ('rknn', ('rknn',)),
+    ):
+        if family in physical:
+            candidates.update(backends)
+    if platform.system() == 'Windows' and physical.intersection({'cuda', 'rocm', 'openvino'}):
+        candidates.add('directml')
+    return candidates
+
+
 def non_accelerator_failure(message):
     return any(word in message.lower() for word in ('no space left', 'invalid data', 'cancel', 'budget', 'permission denied'))
 

@@ -16,6 +16,7 @@ from array import array
 from ..core.errors import ComputeError
 from ..domain.audio_separation import BACKENDS, CLEAN, DSP, LEGACY, MDX, MDX_FILE, MDX_SHA256, recipe, threads
 from ..infrastructure.audio_worker import AudioWorker
+from ..infrastructure.hardware import separation_accelerators
 from ..infrastructure.transcoding.process import run
 
 
@@ -82,6 +83,7 @@ class SeparationEngine:
         present = self.model_ready()
         cpu = self.environment(True)
         accelerated = {} if only_cpu else self.environment(False)
+        physical = set() if only_cpu else separation_accelerators()
         entries = []
         for backend in BACKENDS:
             if only_cpu and backend not in ('cpu', 'openvino-cpu'):
@@ -102,7 +104,7 @@ class SeparationEngine:
                         state, reason = record['state'], record.get('reason', '')
                     if self.cooldown.get(key, 0) > time.monotonic():
                         state, reason = 'FAILED', '后端执行失败，暂时熔断；可重新试跑'
-            entries.append({'id': backend, 'state': state, 'reason': reason, 'detected': detected,
+            entries.append({'id': backend, 'state': state, 'reason': reason, 'detected': detected or backend in physical,
                             'modelId': MDX, 'standaloneCpu': environment.get('standaloneCpu', False)})
         return entries
 

@@ -217,6 +217,18 @@ Go 仓库的组合 Compose 默认不启用计算容器或下载模型；启用�
 
 现有 Docker 应用通过 `COMPUTE_NODE_URL=http://host.docker.internal:18090` 连接本机节点，回调设置为原生节点可访问的业务地址；音频和 VideoToolbox 共用同一个原生进程。安装及重新加载：
 
+原生节点的基础服务与 VideoToolbox 不包含 AI 推理依赖。轻量 AI 使用独立 CPU / MLX 环境：
+
+```sh
+make compute-separation-cpu-setup
+make compute-separation-mlx-setup
+.venv/bin/python scripts/macos-compute.py restart
+```
+
+启动器会加载项目中已安装的 `.venv-audio-cpu` 和 `.venv-audio-mlx`，并保留已显式配置的 `COMPUTE_AUDIO_CPU_PYTHON` / `COMPUTE_AUDIO_ACCELERATOR_PYTHON`；配置必须指向绝对路径的 Python 可执行文件。轻量模型仍需在网页下载或导入，先验证 CPU，再验证 Mac GPU。已检测到 Apple GPU 但缺少运行库时，后端显示 `detected=true / RUNTIME_MISSING`，不会隐藏设备，也不会授予可用资格。
+
+高级 AI 的 Torch / MPS 环境和 HTDemucs 模型使用以下目标：
+
 ```sh
 make compute-audio-setup
 .venv/bin/python scripts/macos-compute.py restart

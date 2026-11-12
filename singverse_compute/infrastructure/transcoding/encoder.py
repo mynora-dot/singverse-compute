@@ -92,7 +92,7 @@ class Encoder:
         copy_audio = target.mode == 'REMUX'
         command += ['-c:a','copy' if copy_audio else 'aac']
         if not copy_audio:
-            command += ['-b:a',str(target.audio_bitrate)]
+            command += ['-profile:a','aac_low', '-b:a',str(target.audio_bitrate)]
             for i, audio in enumerate(audios):
                 # Stereo L/R content is never collapsed; multichannel is limited explicitly.
                 command += [f'-ac:a:{i}',str(min(audio.channels or 2, max(2, target.max_channels)))]

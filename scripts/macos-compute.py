@@ -58,6 +58,23 @@ def pairing_environment(previous):
     return {name: value.lower()}
 
 
+def worker_environment(previous):
+    """Keep explicit worker paths and discover installed project-local workers."""
+    saved = plistlib.loads(previous.read_bytes()).get('EnvironmentVariables', {}) if previous.exists() else {}
+    result = {}
+    for name, directory in (
+        ('COMPUTE_AUDIO_CPU_PYTHON', '.venv-audio-cpu'),
+        ('COMPUTE_AUDIO_ACCELERATOR_PYTHON', '.venv-audio-mlx'),
+    ):
+        configured = os.environ.get(name, saved.get(name, ''))
+        candidate = Path(configured).expanduser() if configured else ROOT / directory / 'bin/python'
+        if configured and (not candidate.is_absolute() or not candidate.is_file() or not os.access(candidate, os.X_OK)):
+            raise ValueError(name + ' must point to an existing absolute Python executable')
+        if configured or candidate.is_file():
+            result[name] = str(candidate)
+    return result
+
+
 def bootstrap(domain, target):
     # bootout returns before launchd finishes removing its registration. A
     # restart can briefly receive EIO even though print already says not found.
@@ -108,6 +125,8 @@ def main():
             'COMPUTE_AUDIO_MEMORY_BYTES', str(4096*1024**2))) // 1024**2 if previous.exists() else 4096
     try:
         audio = audio_environment(model_repo, memory_mib)
+        if args.action != 'stop':
+            audio.update(worker_environment(previous))
         pairing = pairing_environment(previous) if args.action != 'stop' else {}
     except ValueError as error:
         parser.error(str(error))
