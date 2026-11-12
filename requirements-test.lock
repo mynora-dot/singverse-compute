@@ -1,0 +1,4 @@
+# Test-only DSP fixtures; versions match existing optional runtime locks.
+-r requirements.lock
+numpy==1.26.4
+soundfile==0.13.1

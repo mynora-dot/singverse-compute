@@ -1,0 +1,153 @@
+"""Report build support separately from successful device execution."""
+import platform
+import threading
+from .process import run
+from ...core.errors import ComputeError
+
+ENCODERS = {'software': 'libx264', 'qsv': 'h264_qsv', 'nvenc': 'h264_nvenc',
+            'vaapi': 'h264_vaapi', 'amf': 'h264_amf', 'videotoolbox': 'h264_videotoolbox', 'rkmpp': 'h264_rkmpp'}
+
+# Use a conventional video size: some NVENC devices reject 128x128.
+PROBE_SOURCE = 'color=s=1280x720:r=25:d=0.2'
+# Driver initialization can exceed three seconds in CPU-limited NVIDIA containers.
+PROBE_TIMEOUT_SECONDS = {'nvenc': 10}
+
+VIDEO_ENCODERS = {
+    'h264': ENCODERS,
+    'hevc': {'software':'libx265','qsv':'hevc_qsv','nvenc':'hevc_nvenc','vaapi':'hevc_vaapi',
+             'amf':'hevc_amf','videotoolbox':'hevc_videotoolbox','rkmpp':'hevc_rkmpp'},
+    'av1': {'software':'libsvtav1','qsv':'av1_qsv','nvenc':'av1_nvenc','vaapi':'av1_vaapi','amf':'av1_amf'},
+}
+
+class Backends:
+    def __init__(self, executable, preferred='auto', device='/dev/dri/renderD128', memory_limit=1024**3):
+        self.executable, self.preferred, self.device = executable, preferred, device
+        self.memory_limit = memory_limit
+        self.cpu_fallback = True
+        self._results = None
+        self._probes = {}
+        self._listing = None
+        self._features = None
+        self._lock = threading.Lock()
+
+    def prefix(self, name):
+        if name == 'vaapi':
+            return ['-vaapi_device', self.device]
+        if name == 'qsv' and platform.system() == 'Linux':
+            return ['-qsv_device', self.device]
+        return []
+
+    def upload(self, name):
+        return ',format=nv12,hwupload' if name == 'vaapi' else ''
+
+    def test(self, backend):
+        import time
+        started = time.monotonic()
+        eligible = {'Linux':['qsv','vaapi','nvenc','rkmpp'], 'Windows':['qsv','nvenc','amf'], 'Darwin':['videotoolbox']}.get(platform.system(), []) + ['software']
+        order = ['qsv','vaapi','nvenc','videotoolbox','amf','rkmpp','software'] if backend == 'auto' else [backend]
+        for name in order:
+            if name not in eligible:
+                continue
+            try:
+                run([self.executable, '-v','error','-nostdin', *self.prefix(name), '-f','lavfi',
+                     '-i',PROBE_SOURCE, '-vf','format=nv12'+self.upload(name),
+                     '-threads:v','2','-c:v',ENCODERS[name],'-frames:v','3','-f','null','-'],timeout=PROBE_TIMEOUT_SECONDS.get(name, 3), memory_limit=self.memory_limit)
+                return {'passed':True, 'backend':name, 'hardware':name!='software',
+                        'elapsedMs':round((time.monotonic()-started)*1000)}
+            except ComputeError:
+                pass
+        return {'passed':False, 'backend':backend, 'hardware':False,
+                'elapsedMs':round((time.monotonic()-started)*1000)}
+
+    def inspect(self, refresh=False):
+        with self._lock:
+            if refresh:
+                from ..hardware import accelerators
+                accelerators.cache_clear()
+                self._results = None
+                self._probes.clear()
+                self._listing = None
+            if self._results is not None:
+                return self._results
+            results = []
+            for name, encoder in ENCODERS.items():
+                codecs = {}
+                for codec, encoders in VIDEO_ENCODERS.items():
+                    codecs[codec] = self._probe(name, codec)
+                primary = codecs['h264']
+                results.append({'backend': name, 'installed': primary['installed'], 'probeAvailable': any(c['samplePassed'] for c in codecs.values()),
+                                'samplePassed': primary['samplePassed'], 'encoder': encoder, 'codecs':codecs,
+                                'decodeAcceleration': False, 'toneMappingAcceleration': False})
+            self._results = results
+            return results
+
+    def _probe(self, name, codec):
+        """Called under the probe lock; playback tests only its requested codec."""
+        key = (name, codec)
+        if key in self._probes:
+            return self._probes[key]
+        if self._listing is None:
+            try:
+                self._listing = run([self.executable, '-hide_banner', '-encoders'], memory_limit=self.memory_limit).decode()
+            except ComputeError:
+                self._listing = ''
+        eligible = {'Linux':['qsv','vaapi','nvenc','rkmpp'], 'Windows':['qsv','nvenc','amf'],
+                    'Darwin':['videotoolbox']}.get(platform.system(), []) + ['software']
+        implementation = VIDEO_ENCODERS.get(codec, {}).get(name, '')
+        installed = bool(implementation and implementation in self._listing and name in eligible)
+        passed = False
+        if installed:
+            try:
+                extra = ['-preset','8'] if implementation == 'libsvtav1' else []
+                run([self.executable, '-v','error','-nostdin', *self.prefix(name), '-f','lavfi',
+                     '-i',PROBE_SOURCE, '-vf','format=nv12'+self.upload(name),
+                     '-threads:v','2','-c:v',implementation, *extra, '-frames:v','3','-f','null','-'],
+                    timeout=PROBE_TIMEOUT_SECONDS.get(name, 3), memory_limit=self.memory_limit)
+                passed = True
+            except ComputeError:
+                pass
+        result = {'installed':installed, 'samplePassed':passed, 'encoder':implementation}
+        self._probes[key] = result
+        return result
+
+    def invalidate(self):
+        with self._lock:
+            self._results = None
+            self._probes.clear()
+            self._listing = None
+
+    def features(self):
+        if self._features is None:
+            try:
+                listing = run([self.executable, '-hide_banner', '-filters'], memory_limit=self.memory_limit).decode()
+            except ComputeError:
+                listing = ''
+            names = {line.split()[1] for line in listing.splitlines() if len(line.split()) > 2}
+            self._features = {name:name in names for name in ('subtitles','overlay','zscale','tonemap','tonemapx','scale_cuda','tonemap_cuda','yadif_cuda',
+                'scale_vt','tonemap_videotoolbox','bwdif_videotoolbox','scale_vaapi','tonemap_vaapi',
+                'deinterlace_vaapi','vpp_qsv','tonemap_opencl','scale_d3d11','scale_rkrga','hwmap')}
+        return self._features
+
+    def detected(self):
+        from ..hardware import accelerators
+        detected = set(accelerators()['video'])
+        # A successful device trial is also physical evidence (including Windows).
+        if self._results:
+            detected.update(r['backend'] for r in self._results if r['backend'] != 'software' and r.get('probeAvailable'))
+        detected.update(name for (name, _), result in self._probes.copy().items() if name != 'software' and result['samplePassed'])
+        return sorted(detected)
+
+    def select(self, codec='h264', cpu_fallback=None, preferred=None):
+        fallback = self.cpu_fallback if cpu_fallback is None else cpu_fallback
+        preferred = self.preferred if preferred is None else preferred
+        preferred = 'auto' if preferred == 'software' and self.detected() else preferred
+        order = [preferred] if preferred != 'auto' else ['qsv','vaapi','nvenc','videotoolbox','amf','rkmpp']
+        for name in order + (['software'] if fallback or not self.detected() else []):
+            with self._lock:
+                if self._results is not None:
+                    passed = any(r['backend'] == name and r['codecs'].get(codec, {}).get('samplePassed') for r in self._results)
+                else:
+                    passed = self._probe(name, codec)['samplePassed']
+                if passed:
+                    return name
+        raise ComputeError(503, 'No verified encoder available')

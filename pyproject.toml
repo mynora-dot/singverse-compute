@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "singverse-compute"
+dynamic = ["version"]
+description = "SingVerse Python 计算节点骨架"
+requires-python = ">=3.12"
+dependencies = [
+  "cryptography==50.0.2",
+  "mutagen==1.47.0",
+  "fastapi==0.121.3",
+  "uvicorn==0.38.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["singverse_compute*"]
+
+[tool.setuptools.package-data]
+"singverse_compute.infrastructure" = ["PANNS_LICENSE.txt"]
+
+[tool.setuptools.dynamic]
+version = {file = ["VERSION"]}

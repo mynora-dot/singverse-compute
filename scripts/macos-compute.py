@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Run the Mac GPU node in the current user's launchd domain, with Docker's existing token."""
+import argparse
+import json
+import os
+from pathlib import Path
+import platform
+import plistlib
+import subprocess
+import tempfile
+import time
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+ROOT = Path(__file__).resolve().parents[1]
+RUNTIME = ROOT / 'data/macos-compute'
+LABEL = 'com.mynora.singverse.compute.macos'
+NODE_ORIGIN = 'http://127.0.0.1:18090'
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def check_node(token_file, timeout=5):
+    try:
+        token = token_file.read_text(encoding='ascii').strip()
+    except (OSError, UnicodeError) as error:
+        raise ValueError('Cannot read the native compute credential file') from error
+    if not 32 <= len(token) <= 256 or any(not 33 <= ord(char) <= 126 for char in token):
+        raise ValueError('Invalid native compute credential file')
+    request = Request(NODE_ORIGIN + '/internal/v1/status', headers={'Authorization': 'Bearer ' + token})
+    # A local readiness check must never send credentials to a proxy or redirect.
+    with build_opener(ProxyHandler({}), NoRedirect()).open(request, timeout=timeout) as response:
+        body = response.read(65537)
+        if len(body) > 65536:
+            raise ValueError('Native compute status exceeded limit')
+        value = json.loads(body)
+        if response.status != 200 or not isinstance(value, dict) or value.get('service') != 'singverse-compute' or value.get('apiVersion') != '1':
+            raise ValueError('Native compute returned an incompatible status')
+
+
+def audio_environment(model_repo, memory_mib):
+    if not model_repo.is_absolute() or memory_mib < 512:
+        raise ValueError('Use an absolute model directory and at least 512 MiB audio budget')
+    return {'COMPUTE_AUDIO_MODEL_REPO': str(model_repo),
+            'COMPUTE_AUDIO_MEMORY_BYTES': str(memory_mib * 1024**2),
+            'COMPUTE_AUDIO_THREADS': '2', 'PYTORCH_ENABLE_MPS_FALLBACK': '0'}
+
+
+def pairing_environment(previous):
+    name = 'COMPUTE_LAN_PAIRING_ENABLED'
+    value = os.environ.get(name)
+    if value is None:
+        value = plistlib.loads(previous.read_bytes()).get('EnvironmentVariables', {}).get(name, 'true') if previous.exists() else 'true'
+    if not isinstance(value, str) or value.lower() not in ('true', 'false'):
+        raise ValueError(name + ' must be true or false')
+    return {name: value.lower()}
+
+
+def bootstrap(domain, target):
+    # bootout returns before launchd finishes removing its registration. A
+    # restart can briefly receive EIO even though print already says not found.
+    for _ in range(20):
+        result = subprocess.run(['launchctl', 'bootstrap', domain, str(target)], capture_output=True)
+        if result.returncode == 0:
+            return
+        if result.returncode != 5:
+            break
+        time.sleep(.25)
+    raise SystemExit('Mac node could not be loaded; inspect launchd and the private runtime logs')
+
+
+def login_agent(enable):
+    agent = Path.home() / 'Library/LaunchAgents' / (LABEL + '.plist')
+    target = RUNTIME / 'compute.plist'
+    if agent.exists() or agent.is_symlink():
+        if not agent.is_symlink() or agent.resolve() != target.resolve():
+            raise SystemExit('Another login agent owns this label; preserve it and reconcile before continuing')
+        if not enable:
+            agent.unlink()
+    elif enable:
+        agent.parent.mkdir(parents=True, exist_ok=True)
+        agent.symlink_to(target)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=('start', 'restart', 'stop', 'status'))
+    parser.add_argument('--token-file', type=Path, help='Explicit existing credential file to import; otherwise the node creates its own credential for LAN pairing')
+    parser.add_argument('--audio-model-repo', type=Path, default=ROOT / '.tools/demucs-htdemucs')
+    parser.add_argument('--audio-memory-mib', type=int, default=None,
+                        help='Explicit audio process budget; restart preserves the saved budget, otherwise 4096 MiB')
+    args = parser.parse_args()
+    if platform.system() != 'Darwin':
+        parser.error('This launcher requires macOS; use the platform deployment instructions elsewhere')
+    domain = f'gui/{os.getuid()}'
+    service = domain + '/' + LABEL
+    active = subprocess.run(['launchctl', 'print', service], capture_output=True)
+    if args.action == 'status':
+        print('loaded' if active.returncode == 0 else 'stopped')
+        return
+    model_repo = args.audio_model_repo.expanduser().resolve()
+    memory_mib = args.audio_memory_mib
+    previous = RUNTIME / 'compute.plist'
+    if memory_mib is None:
+        memory_mib = int(plistlib.loads(previous.read_bytes()).get('EnvironmentVariables', {}).get(
+            'COMPUTE_AUDIO_MEMORY_BYTES', str(4096*1024**2))) // 1024**2 if previous.exists() else 4096
+    try:
+        audio = audio_environment(model_repo, memory_mib)
+        pairing = pairing_environment(previous) if args.action != 'stop' else {}
+    except ValueError as error:
+        parser.error(str(error))
+    if active.returncode == 0:
+        # Do not unload another checkout's node under the same label.
+        if str(ROOT).encode() not in active.stdout:
+            raise SystemExit('Another checkout owns this launchd label; preserve it and stop it explicitly first')
+        if args.action == 'start':
+            try:
+                check_node(RUNTIME / 'token')
+            except (OSError, ValueError):
+                raise SystemExit('Mac compute is running but authenticated status failed; check credential file access and run scripts/macos-compute.py restart') from None
+            login_agent(True)
+            print('Mac compute already running')
+            return
+        if args.action == 'stop':
+            subprocess.run(['launchctl', 'bootout', service], check=True)
+    if args.action == 'stop':
+        login_agent(False)
+        return
+    os.umask(0o077)
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    for folder in ('media', 'cache'):
+        (RUNTIME / folder).mkdir(exist_ok=True)
+    # Only the shared media directory is mounted into Go, read-only.
+    (RUNTIME / 'media').chmod(0o755)
+    python = ROOT / '.venv/bin/python'
+    ffmpeg = ROOT / '.tools/jellyfin-ffmpeg/ffmpeg'
+    ffprobe = ROOT / '.tools/jellyfin-ffmpeg/ffprobe'
+    for executable in (python, ffmpeg, ffprobe):
+        if not executable.is_file():
+            raise SystemExit('Run make compute-setup and make transcode-tools before starting the Mac node')
+    # Import a credential only when explicitly requested; independent nodes pair through Go.
+    if args.token_file is not None:
+        token = args.token_file.resolve(strict=True)
+        destination = RUNTIME / 'token'
+        value = token.read_bytes()
+        if destination.exists() and destination.read_bytes() != value:
+            raise SystemExit('Existing native token differs; preserve it and reconcile credentials before starting')
+        destination.write_bytes(value)
+        destination.chmod(0o600)
+    manifest = {
+        'Label': LABEL,
+        'ProgramArguments': [str(python), '-m', 'singverse_compute', '--host', '127.0.0.1', '--port', '18090'],
+        'WorkingDirectory': str(ROOT),
+        'EnvironmentVariables': {
+            'COMPUTE_AUTH_TOKEN_FILE': str(RUNTIME / 'token'),
+            'COMPUTE_TRANSCODE_ROOT': str(RUNTIME / 'cache'),
+            'COMPUTE_FFMPEG': str(ffmpeg), 'COMPUTE_FFPROBE': str(ffprobe),
+            'COMPUTE_HARDWARE_BACKEND': 'videotoolbox',
+            'COMPUTE_PROCESS_MEMORY_BYTES': '1073741824',
+            **audio,
+            **pairing,
+        },
+        'RunAtLoad': True, 'KeepAlive': True, 'ThrottleInterval': 10,
+        'StandardOutPath': str(RUNTIME / 'node.log'),
+        'StandardErrorPath': str(RUNTIME / 'node-error.log'),
+    }
+    target = RUNTIME / 'compute.plist'
+    target.write_bytes(plistlib.dumps(manifest))
+    login_agent(True)
+    if active.returncode == 0:
+        subprocess.run(['launchctl', 'bootout', service], check=True)
+    bootstrap(domain, target)
+    for _ in range(120):
+        try:
+            check_node(RUNTIME / 'token', timeout=1)
+            print('Mac compute ready on loopback port 18090 (VideoToolbox; installed audio models are qualified automatically in background)')
+            return
+        except (OSError, ValueError):
+            time.sleep(.25)
+    raise SystemExit('Mac node did not pass authenticated status; check credential file access and the private runtime logs')
+
+
+if __name__ == '__main__':
+    main()
