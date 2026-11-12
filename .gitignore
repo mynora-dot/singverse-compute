@@ -156,3 +156,6 @@ secrets/
 test-output/
 
 /singverse_compute/core/build.json
+
+# Personal agent skills are maintained outside this repository.
+/skills/
