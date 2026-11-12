@@ -92,11 +92,22 @@ class Transcoding:
         return bool(self.root and self.auth.available and shutil.which(self.settings.ffmpeg) and shutil.which(self.settings.ffprobe))
 
     @contextmanager
-    def input(self, reference, callback_origin, resource='transcode-input'):
+    def input(self, reference, callback_origin, resource='transcode-input', bounded=False, deep=False):
         if not reference or not callback_origin:
             raise ComputeError(503, 'Remote media input is not configured')
-        with self.remote(callback_origin, reference, self.auth._token(), resource) as url:
-            yield url, True
+        if bounded:
+            from ..infrastructure.media.remote_tags import RangeFile, loopback
+            # One input object lives across the worker's probe and all windows.
+            # It has no disk spill and is destroyed on every worker exit.
+            with RangeFile(callback_origin, reference, self.auth._token(), 'audio', None, deep=deep, resource=resource) as source:
+                source.limit = (128 if deep else 64) * 1024 * 1024
+                source.max_requests = 256 if deep else 128
+                source.deadline = time.monotonic() + (300 if deep else 180)
+                with loopback(source) as url:
+                    yield url, True
+        else:
+            with self.remote(callback_origin, reference, self.auth._token(), resource) as url:
+                yield url, True
 
     def inspect(self, reference, callback_origin, fingerprint=None):
         if not self.available:

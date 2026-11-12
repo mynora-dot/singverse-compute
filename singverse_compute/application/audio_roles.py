@@ -21,6 +21,7 @@ from .fast_audio_roles import classify_labels, classify_scores, VERSION as FAST_
 from ..core.errors import ComputeError
 from ..core.audio_runtime import audio_runtime_profile
 from ..infrastructure.transcoding.process import run
+from ..infrastructure.media.audio_workspace import acquire as workspace_lease
 
 
 def _rms(path: Path) -> float:
@@ -49,7 +50,9 @@ class AudioTask:
     cancel: threading.Event = field(default_factory=threading.Event)
 
     def view(self):
-        return {'id': self.id, 'state': self.state, 'result': self.result, 'error': self.error}
+        result = self.result.copy()
+        result.pop('cleanupPaths', None)
+        return {'id': self.id, 'state': self.state, 'result': result, 'error': self.error}
 
 
 class AudioRoles:
@@ -61,6 +64,7 @@ class AudioRoles:
         self.tasks: dict[str, AudioTask] = {}
         self.lock = threading.RLock()
         self.collection_lock = threading.Lock()
+        self.cleanup_lock = threading.Lock()
         self.stopping = False
         self.active = False
         self.thread = None
@@ -77,25 +81,84 @@ class AudioRoles:
         self.slot = threading.BoundedSemaphore(1)
         if self.root:
             self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            # Only this feature's interrupted workspace is removed; media roots remain read only.
+            startup_cleanup = {}
+            # A shared cache volume can have another live worker. Reclaim only
+            # task-owned paths whose OS lease is free, including after a crash.
             for partial in self.root.glob('*.part'):
-                partial.unlink(missing_ok=True)
+                try:
+                    identifier = str(uuid.UUID(partial.name[:36]))
+                    if partial.name not in (identifier + '.part', identifier + '.json.part'):
+                        continue
+                    owner = workspace_lease(self.root, identifier)
+                    if owner:
+                        with owner:
+                            try:
+                                partial.unlink(missing_ok=True)
+                            except OSError:
+                                startup_cleanup.setdefault(identifier, []).append(partial.name)
+                except (ValueError, OSError):
+                    continue
             for work in self.root.glob('work-*'):
-                if work.is_dir() and not work.is_symlink():
-                    shutil.rmtree(work)
+                try:
+                    if not work.is_dir() or work.is_symlink():
+                        continue
+                    identifier = str(uuid.UUID(work.name[5:41]))
+                    marker = work / '.singverse-audio-workspace'
+                    known = not marker.is_symlink() and marker.is_file() and marker.read_text() == identifier
+                    record = self.root / f'{identifier}.json'
+                    if not known and not record.is_symlink() and record.is_file():
+                        receipt = json.loads(record.read_text())
+                        known = isinstance(receipt, dict) and receipt.get('id') == identifier
+                    if not known:
+                        continue
+                    owner = workspace_lease(self.root, identifier)
+                    if owner:
+                        with owner:
+                            if work.is_dir() and not work.is_symlink():
+                                try:
+                                    shutil.rmtree(work)
+                                except OSError:
+                                    startup_cleanup.setdefault(identifier, []).append(work.name)
+                except (ValueError, OSError):
+                    continue
             for record in self.root.glob('*.json'):
                 try:
-                    data = json.loads(record.read_text())
-                    if str(uuid.UUID(data['id'])) != record.stem:
+                    owner = workspace_lease(self.root, record.stem)
+                    if owner is None:
                         continue
-                    task = AudioTask(data['id'], data['state'], data.get('result', {}), data.get('error', ''))
-                    task.signature = data.get('signature', '')
-                    if task.state not in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
-                        task.state, task.error = 'FAILED', 'NODE_RESTARTED'
-                    self.tasks[task.id] = task
-                    if task.error == 'NODE_RESTARTED':
-                        self._save(task)
+                    with owner:
+                        data = json.loads(record.read_text())
+                        if not isinstance(data, dict) or data.get('id') != record.stem:
+                            continue
+                        result = data.get('result', {})
+                        task = AudioTask(data['id'], data['state'], result if isinstance(result, dict) else {}, data.get('error', ''))
+                        task.signature = data.get('signature', '')
+                        if task.state not in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
+                            task.state, task.error = 'FAILED', 'NODE_RESTARTED'
+                        self.tasks[task.id] = task
+                        if task.id in startup_cleanup:
+                            paths = task.result.get('cleanupPaths', [])
+                            task.result['cleanupPaths'] = list(dict.fromkeys((paths if isinstance(paths, list) else []) + startup_cleanup[task.id]))
+                            task.result.update(cleanupState='PENDING', cleanupError='临时文件清理失败，将自动重试')
+                            self._save(task)
+                        if task.error == 'NODE_RESTARTED':
+                            self._save(task)
+                        if task.result.get('cleanupState') == 'PENDING':
+                            self._cleanup_task(task, owned=True)
                 except (ValueError, KeyError, OSError):
+                    continue
+            # A marked workspace can outlive a crash before its first receipt.
+            for identifier, paths in startup_cleanup.items():
+                if identifier in self.tasks:
+                    continue
+                try:
+                    owner = workspace_lease(self.root, identifier)
+                    if owner:
+                        with owner:
+                            task = AudioTask(identifier, 'FAILED', {'cleanupState': 'PENDING', 'cleanupError': '临时文件清理失败，将自动重试', 'cleanupPaths': paths}, 'NODE_RESTARTED')
+                            self.tasks[identifier] = task
+                            self._save(task)
+                except OSError:
                     continue
 
     @property
@@ -204,6 +267,77 @@ class AudioRoles:
             with self.lock:
                 timings = task.result.setdefault('timingsMs', {})
                 timings[name] = round(timings.get(name, 0) + (time.monotonic()-started)*1000, 3)
+
+    @contextmanager
+    def workspace(self, task):
+        """Keep cleanup receipts independent from the result of media computation."""
+        work = Path(tempfile.mkdtemp(prefix='work-' + task.id + '-', dir=self.root))
+        task.result.setdefault('cleanupPaths', []).append(work.name)
+        task.result['cleanupState'] = 'PENDING'
+        try:
+            (work / '.singverse-audio-workspace').write_text(task.id)
+            if task.id in self.tasks:
+                self.save(task)
+            yield work
+        finally:
+            self._cleanup_task(task, owned=True)
+
+    def _discard(self, task, *paths):
+        for path in paths:
+            path = Path(path)
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                if path.parent == self.root and path.name in (task.id + '.part', task.id + '.json.part', task.id + '.m4a', task.id + '.flac'):
+                    pending = task.result.setdefault('cleanupPaths', [])
+                    if path.name not in pending:
+                        pending.append(path.name)
+                task.result.update(cleanupState='PENDING', cleanupError='临时文件清理失败，将自动重试')
+
+    def _cleanup_task(self, task, owned=False):
+        if not self.cleanup_lock.acquire(blocking=False):
+            return
+        owner = None
+        try:
+            if not owned:
+                owner = workspace_lease(self.root, task.id)
+                if owner is None:
+                    return
+            remaining = []
+            for name in task.result.get('cleanupPaths', []):
+                # Receipts contain task-owned directory names, never arbitrary paths.
+                if not isinstance(name, str) or Path(name).name != name or not (name.startswith('work-' + task.id + '-') or name in (task.id + '.part', task.id + '.json.part', task.id + '.m4a', task.id + '.flac')):
+                    remaining.append(name)
+                    continue
+                work = self.root / name
+                try:
+                    if work.is_symlink():
+                        work.unlink()
+                    elif work.is_dir():
+                        shutil.rmtree(work)
+                    else:
+                        work.unlink(missing_ok=True)
+                except OSError:
+                    remaining.append(name)
+            task.result['cleanupPaths'] = remaining
+            task.result['cleanupState'] = 'PENDING' if remaining else 'RELEASED'
+            task.result['cleanupError'] = '临时文件清理失败，将自动重试' if remaining else ''
+            if task.id in self.tasks:
+                try:
+                    self.save(task)
+                except OSError:
+                    # Cleanup must not turn a computed result into a failure. The
+                    # last durable pending receipt is retried after the next start.
+                    pass
+        except OSError:
+            task.result.update(cleanupState='PENDING', cleanupError='临时文件清理失败，将自动重试')
+        finally:
+            if owner is not None:
+                owner.close()
+            self.cleanup_lock.release()
 
     def inference_event(self, task, value):
         if value.get('event') != 'AUDIO_INFERENCE_PROGRESS':
@@ -338,7 +472,7 @@ class AudioRoles:
         windows, pairs = [], []
         # Three initial reads; only sparse evidence receives three additional excerpts.
         # No full-song decoding or implicit stem separation, even when still uncertain.
-        with tempfile.TemporaryDirectory(prefix='work-' + task.id + '-', dir=self.root) as temporary:
+        with self.workspace(task) as temporary:
             for fractions in ((.25, .5, .75), (.1, .4, .9)):
                 paths = []
                 for fraction in fractions:
@@ -354,7 +488,11 @@ class AudioRoles:
                                         '-af', 'aresample=async=1:first_pts=0,apad', '-c:a', 'pcm_s16le', '-y', str(path)])
                         paths.append(path)
                     self._run(command, task)
-                scores = self.fast.predict(paths, task.cancel)
+                try:
+                    scores = self.fast.predict(paths, task.cancel)
+                finally:
+                    # Scores, rather than WAVs, are the inputs to later rounds.
+                    self._discard(task, *paths)
                 pairs.extend(zip(scores[::2], scores[1::2]))
                 result = classify_scores(pairs, titles)
                 # Short media cannot provide independent extra six-second excerpts.
@@ -426,6 +564,14 @@ class AudioRoles:
                 raise ComputeError(429, 'Realtime playback has priority')
             if not self.slot.acquire(blocking=False):
                 raise ComputeError(429, 'Audio model worker busy')
+            try:
+                owner = workspace_lease(self.root, identifier)
+            except OSError:
+                self.slot.release()
+                raise
+            if owner is None:
+                self.slot.release()
+                raise ComputeError(429, 'Audio task is active on another worker')
             self.active = True
             task = AudioTask(identifier)
             task.mode = mode
@@ -451,6 +597,7 @@ class AudioRoles:
                 self.tasks.pop(identifier, None)
                 self.active = False
                 self.slot.release()
+                owner.close()
                 raise ComputeError(507, 'Audio task state cannot be persisted') from error
         def preempt():
             while not task.cancel.wait(.25):
@@ -460,12 +607,12 @@ class AudioRoles:
                     task.error = 'REALTIME_PREEMPTED'
                     task.cancel.set()
                     return
-        def worker():
+        def execute():
             threading.Thread(target=preempt, daemon=True).start()
             try:
                 task.state = 'RUNNING'
                 self.save(task)
-                with self.transcoding.input(reference, callback_origin, 'audio-input') as (source, network):
+                with self.transcoding.input(reference, callback_origin, 'audio-input', bounded=mode in ('PROBE', 'FAST', 'ANALYZE'), deep=mode == 'ANALYZE') as (source, network):
                     with self.stage(task, 'probe'):
                         media = self.transcoding.probe.read_audio(source, network, cancel=task.cancel)
                     audio = [s for s in media.streams if s.kind == 'audio']
@@ -498,7 +645,7 @@ class AudioRoles:
                         estimate = int((min(12, media.duration) if preview else media.duration) * (352800 if output_format == 'flac' else 32000) + 65536)
                     if estimate + sum(p.stat().st_size for suffix in ('*.m4a', '*.flac') for p in self.root.glob(suffix)) > self.settings.cache_bytes or shutil.disk_usage(self.root).free < estimate + self.settings.minimum_free_bytes:
                         raise ComputeError(507, 'Audio task exceeds disk budget')
-                    with tempfile.TemporaryDirectory(prefix='work-'+identifier+'-', dir=self.root) as temp:
+                    with self.workspace(task) as temp:
                         work = Path(temp)
                         if mode == 'ANALYZE':
                             evidence, windows = [], []
@@ -510,6 +657,7 @@ class AudioRoles:
                                     with self.stage(task, 'separate'):
                                         vocal, _ = self._separate(wav, work / f'out-{len(evidence)}-{stream.index}', task)
                                     measured = vocal_activity(wav, vocal)
+                                    self._discard(task, wav, work / f'out-{len(evidence)}-{stream.index}')
                                     levels.append(measured['level'])
                                     activity.append(measured)
                                 evidence.append(tuple(levels))
@@ -566,24 +714,30 @@ class AudioRoles:
                 task.result['diagnostic'] = error.message if isinstance(error, ComputeError) else 'Audio worker failed unexpectedly'
                 task.error = task.error or ('AUDIO_MEMORY_LIMIT' if isinstance(error, ComputeError) and 'memory budget' in error.message else 'AUDIO_EXECUTION_FAILED')
                 task.state = 'CANCELLED' if task.cancel.is_set() else 'FAILED'
-                for suffix in ('.part', '.m4a', '.flac'):
-                    (self.root / f'{identifier}{suffix}').unlink(missing_ok=True)
             finally:
-                task.result.setdefault('timingsMs', {})['total'] = round((time.monotonic()-submitted)*1000, 3)
-                task.result['stage'] = task.state
-                if mode in ('ANALYZE', 'SEPARATE') and not enhanced:
-                    if getattr(task, 'fallback_reason', ''): task.result['fallbackReason'] = task.fallback_reason
-                    task.result.update(self.execution(task.backend))
-                    if task.backend == 'mps':
-                        task.result['pipeline'] = 'mps+cpu-stft'
-                if task.state != 'SUCCEEDED':
-                    for suffix in ('.part', '.m4a', '.flac'):
-                        (self.root / f'{identifier}{suffix}').unlink(missing_ok=True)
                 try:
+                    task.result.setdefault('cleanupState', 'RELEASED')
+                    task.result.setdefault('cleanupError', '')
+                    task.result.setdefault('cleanupPaths', [])
+                    if task.state != 'SUCCEEDED':
+                        self._discard(task, *(self.root / f'{identifier}{suffix}' for suffix in ('.part', '.m4a', '.flac')))
+                    self._cleanup_task(task, owned=True)
+                    task.result.setdefault('timingsMs', {})['total'] = round((time.monotonic()-submitted)*1000, 3)
+                    task.result['stage'] = task.state
+                    if mode in ('ANALYZE', 'SEPARATE') and not enhanced:
+                        if getattr(task, 'fallback_reason', ''): task.result['fallbackReason'] = task.fallback_reason
+                        task.result.update(self.execution(task.backend))
+                        if task.backend == 'mps':
+                            task.result['pipeline'] = 'mps+cpu-stft'
                     self.save(task)
                 finally:
                     self.active = False
                     self.slot.release()
+        def worker():
+            try:
+                execute()
+            finally:
+                owner.close()
         self.thread = threading.Thread(target=worker, name='audio-role-worker', daemon=True)
         self.thread.start()
         return task.view()
@@ -627,6 +781,10 @@ class AudioRoles:
             for identifier, task in tasks:
                 record = self.root / f'{identifier}.json'
                 try:
+                    if task.result.get('cleanupState') == 'PENDING':
+                        self._cleanup_task(task)
+                        if task.result.get('cleanupState') == 'PENDING':
+                            continue
                     if task.state in ('SUCCEEDED', 'FAILED', 'CANCELLED') and time.time()-record.stat().st_mtime > 7*86400:
                         self.release(identifier)
                         record.unlink(missing_ok=True)
@@ -648,8 +806,14 @@ class AudioRoles:
             raise ComputeError(404, 'Audio task not found')
         if task.state not in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
             raise ComputeError(409, 'Audio task is still active')
-        for suffix in ('.m4a', '.flac', '.part'):
-            (self.root / f'{task.id}{suffix}').unlink(missing_ok=True)
+        owner = workspace_lease(self.root, identifier)
+        if owner is None:
+            raise ComputeError(409, 'Audio worker has not finished releasing its files')
+        with owner:
+            if task.result.get('cleanupState') == 'PENDING':
+                self._cleanup_task(task, owned=True)
+            for suffix in ('.m4a', '.flac', '.part'):
+                (self.root / f'{task.id}{suffix}').unlink(missing_ok=True)
         self.transcoding.storage_dirty.set()
         return task.view()
 
@@ -659,7 +823,7 @@ class AudioRoles:
 
     def _save(self, task):
         temporary = self.root / f'{task.id}.json.part'
-        temporary.write_text(json.dumps({**task.view(), 'signature': getattr(task, 'signature', '')}), encoding='utf-8')
+        temporary.write_text(json.dumps({**task.view(), 'result': task.result, 'signature': getattr(task, 'signature', '')}), encoding='utf-8')
         temporary.replace(self.root / f'{task.id}.json')
         self.transcoding.storage_dirty.set()
 
@@ -682,6 +846,8 @@ class AudioRoles:
         task = self.tasks.get(identifier)
         if task is None:
             raise ComputeError(404, 'Audio task not found')
+        if task.state in ('SUCCEEDED', 'FAILED', 'CANCELLED') and task.result.get('cleanupState') == 'PENDING':
+            self._cleanup_task(task)
         return task.view()
 
     def cancel(self, identifier):
@@ -691,6 +857,10 @@ class AudioRoles:
         task.cancel.set()
         if task.state in ('QUEUED', 'RUNNING'):
             task.state = 'CANCELLED'
+            # Cancellation can precede worker exit. Its lease prevents polling
+            # from deleting live WAVs, and the worker records RELEASED on exit.
+            task.result.update(cleanupState='PENDING', cleanupError='')
+            task.result.setdefault('cleanupPaths', [])
             self.save(task)
         return task.view()
 

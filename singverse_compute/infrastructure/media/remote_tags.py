@@ -23,11 +23,13 @@ class ReadStopped(Exception):
 
 class RangeFile(RawIOBase):
     """Read-only seekable object; every consumer shares a bounded block cache."""
-    def __init__(self, origin, reference, token, name, size, deep=False):
+    def __init__(self, origin, reference, token, name, size, deep=False, resource='metadata-input'):
         super().__init__()
         from ..transcoding.input import validate_origin
         validate_origin(origin)
-        self.url = origin + '/api/v1/internal/metadata-input/' + reference
+        if resource not in ('metadata-input', 'audio-input'):
+            raise ValueError('Invalid bounded media resource')
+        self.url = origin + '/api/v1/internal/' + resource + '/' + reference
         self.token, self.name = token, name
         self.size, self.position = size, 0
         self.limit = (128 if deep else 16) * BLOCK
@@ -37,6 +39,12 @@ class RangeFile(RawIOBase):
         self.bytes_read = self.requests = 0
         self.reason = None
         self.lock = threading.RLock()
+
+    def close(self):
+        with self.lock:
+            self.cache.clear()
+            self.reason = self.reason or 'CLOSED'
+        super().close()
 
     def readable(self): return True
     def seekable(self): return True
@@ -53,6 +61,8 @@ class RangeFile(RawIOBase):
 
     def block(self, index):
         with self.lock:
+            if self.reason and self.reason != 'BUDGET_EXCEEDED': raise ReadStopped(self.reason)
+            if time.monotonic() >= self.deadline: self.stop('BUDGET_EXCEEDED')
             if index in self.cache: return self.cache[index]
             if self.reason: raise ReadStopped(self.reason)
             if time.monotonic() >= self.deadline or self.requests >= self.max_requests or self.bytes_read >= self.limit:
