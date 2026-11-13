@@ -107,7 +107,7 @@ class PlaybackStartupTest(CallbackTestCase):
             probe = SimpleNamespace(read=Mock(return_value=media))
             def encode(source, network, media, target, directory, cancel, progress, backend):
                 (directory / 'master.m3u8').write_text('#EXTM3U\nstream_0.m3u8\n')
-                (directory / 'stream_0.m3u8').write_text('#EXTM3U\nstream_0_000000.ts\n#EXT-X-ENDLIST\n')
+                (directory / 'stream_0.m3u8').write_text('#EXTM3U\n#EXTINF:60,\nstream_0_000000.ts\n#EXT-X-ENDLIST\n')
                 (directory / 'stream_0_000000.ts').write_bytes(b'complete media')
                 return []
             settings = Settings(token_file=root / 'token', transcode_root=root / 'cache', minimum_free_bytes=0,

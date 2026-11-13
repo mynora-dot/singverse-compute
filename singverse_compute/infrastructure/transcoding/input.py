@@ -3,10 +3,12 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import HTTPError
+from http.client import HTTPException
 import threading
 import secrets
 import ipaddress
 import socket
+import logging
 from urllib.parse import urlsplit
 from ...core.errors import ComputeError
 
@@ -64,19 +66,29 @@ def remote_input(origin, reference, token, resource='transcode-input'):
                             self.send_header(name, response.headers[name])
                     self.end_headers()
                     if not head:
+                        expected = response.headers.get('Content-Length')
+                        expected = int(expected) if expected and expected.isdigit() else None
+                        received = 0
                         while active.is_set() and (chunk := response.read(65536)):
                             try:
                                 self.wfile.write(chunk)
+                                received += len(chunk)
                             except (BrokenPipeError, ConnectionResetError):
                                 # FFprobe/FFmpeg can stop a range early after reading enough.
                                 # A reader closing normally is not a failed business origin.
                                 self.close_connection = True
                                 return
+                        if active.is_set() and expected is not None and received != expected:
+                            logging.getLogger('singverse_compute.input').warning(
+                                'Media callback truncated: expected_bytes=%d received_bytes=%d ranged=%s',
+                                expected, received, bool(self.headers.get('Range')))
+                            failure.append('Media callback ended before the declared content length')
+                            self.close_connection = True
             except HTTPError as error:
                 failure.append(f'Media callback returned HTTP {error.code}')
                 self.send_error(error.code)
                 error.close()
-            except OSError:
+            except (OSError, HTTPException):
                 failure.append('Media callback connection failed')
                 self.close_connection = True
     server = ThreadingHTTPServer(('127.0.0.1', 0), Reader)
@@ -86,6 +98,8 @@ def remote_input(origin, reference, token, resource='transcode-input'):
     try:
         try:
             yield f'http://127.0.0.1:{server.server_port}{route}'
+            if failure:
+                raise ComputeError(422, failure[-1])
         except ComputeError as error:
             if failure:
                 raise ComputeError(422, failure[-1]) from error

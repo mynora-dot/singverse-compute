@@ -46,3 +46,30 @@ class CallbackOriginTest(unittest.TestCase):
                 server.serve_forever.assert_called_once_with(poll_interval=.02)
                 server.shutdown.assert_called_once()
                 server.server_close.assert_called_once()
+
+    def test_callback_early_eof_is_reported_even_if_the_media_reader_accepts_it(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.request import urlopen
+        import threading
+        from singverse_compute.infrastructure.transcoding.input import remote_input
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Length', '100')
+                self.end_headers()
+                self.wfile.write(b'partial')
+                self.close_connection = True
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=.02), daemon=True)
+        thread.start()
+        try:
+            with self.assertRaises(ComputeError) as error:
+                with remote_input(f'http://127.0.0.1:{server.server_port}', 'fixture', 'fixture-token') as url:
+                    with urlopen(url) as response:
+                        # Like FFmpeg, a chunked reader can accept early EOF without
+                        # turning it into a failed exit status itself.
+                        while response.read(65536): pass
+            self.assertIn('declared content length', error.exception.message)
+        finally:
+            server.shutdown(); server.server_close(); thread.join(2)

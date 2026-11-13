@@ -1,5 +1,6 @@
 """Validate and describe temporary FFmpeg outputs for transfer to Go."""
 import hashlib
+import math
 import os
 import re
 import stat
@@ -41,7 +42,7 @@ def ready_hls(directory):
         return False
 
 
-def completed_hls(directory):
+def completed_hls(directory, expected_duration=0):
     """Only complete, local playlists and their fixed-name media can be exported."""
     if directory.is_symlink():
         raise ComputeError(409, 'Execution artifact directory is invalid')
@@ -55,6 +56,7 @@ def completed_hls(directory):
     playlists = [name for name in artifacts if name.endswith('.m3u8')]
     if 'master.m3u8' not in artifacts or len(playlists) < 2 or not any(name.endswith(('.ts', '.m4s')) for name in artifacts):
         raise ComputeError(409, 'Completed HLS artifacts are incomplete')
+    longest = 0.0
     for name in playlists:
         if artifacts[name] > 2 * 1024**2:
             raise ComputeError(409, 'Execution playlist exceeds transfer limits')
@@ -70,6 +72,19 @@ def completed_hls(directory):
             raise ComputeError(409, 'Completed HLS master has no media playlists')
         if name != 'master.m3u8' and not any(ref.endswith(('.ts', '.m4s')) for ref in references):
             raise ComputeError(409, 'Completed HLS media playlist has no segments')
+        if name != 'master.m3u8':
+            try:
+                durations = [float(line.removeprefix('#EXTINF:').split(',', 1)[0])
+                             for line in lines if line.startswith('#EXTINF:')]
+            except ValueError as error:
+                raise ComputeError(409, 'Completed HLS segment duration is invalid') from error
+            if not durations or any(not math.isfinite(value) or value <= 0 for value in durations):
+                raise ComputeError(409, 'Completed HLS segment duration is invalid')
+            longest = max(longest, sum(durations))
+    # FFmpeg may write ENDLIST and exit successfully after an early input EOF.
+    # A terminal playlist alone is not evidence that the complete song exists.
+    if expected_duration > 0 and longest + max(2, expected_duration * .02) < expected_duration:
+        raise ComputeError(422, 'Incomplete HLS output: source ended before the expected duration')
     return artifacts
 
 

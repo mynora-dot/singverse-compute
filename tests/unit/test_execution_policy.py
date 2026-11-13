@@ -107,7 +107,7 @@ class ExecutionPolicyTest(CallbackTestCase):
                         if published: (directory/'master.m3u8').write_text('#EXTM3U')
                         raise ComputeError(422, message)
                     (directory/'master.m3u8').write_text('#EXTM3U\nstream_0.m3u8\n')
-                    (directory/'stream_0.m3u8').write_text('#EXTM3U\nstream_0_000000.ts\n#EXT-X-ENDLIST\n')
+                    (directory/'stream_0.m3u8').write_text('#EXTM3U\n#EXTINF:60,\nstream_0_000000.ts\n#EXT-X-ENDLIST\n')
                     (directory/'stream_0_000000.ts').write_bytes(b'complete fixture')
                     return []
                 service = Transcoding(config, auth, probe, SimpleNamespace(execute=encode), backends, remote_input)

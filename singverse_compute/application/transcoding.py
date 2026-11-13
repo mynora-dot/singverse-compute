@@ -278,7 +278,7 @@ class Transcoding:
                                    'media':asdict(self.probe.read(output))}
                 outcome = 'CANCELLED' if task.cancel.is_set() else 'SUCCEEDED'
                 if outcome == 'SUCCEEDED' and task.target.purpose == 'REALTIME':
-                    completed_hls(directory)
+                    completed_hls(directory, max(0, media.duration - task.target.start))
         except ComputeError as error:
             outcome = 'CANCELLED' if task.cancel.is_set() and not task.error else 'FAILED'
             task.error = task.error or error.message

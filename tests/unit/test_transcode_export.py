@@ -41,7 +41,7 @@ class TranscodeExportTest(CallbackTestCase):
                 (directory / 'output.mp4').write_bytes(b'completed offline')
             else:
                 (directory / 'master.m3u8').write_text('#EXTM3U\nstream_0.m3u8\n')
-                (directory / 'stream_0.m3u8').write_text('#EXTM3U\n#EXT-X-MAP:URI="init_0.mp4"\nstream_0_000000.m4s\n#EXT-X-ENDLIST\n')
+                (directory / 'stream_0.m3u8').write_text(f'#EXTM3U\n#EXT-X-MAP:URI="init_0.mp4"\n#EXTINF:{60-target.start},\nstream_0_000000.m4s\n#EXT-X-ENDLIST\n')
                 (directory / 'init_0.mp4').write_bytes(b'initialization')
                 (directory / 'stream_0_000000.m4s').write_bytes(b'complete media data')
             return [{'sourceId': 'stream:0', 'kind': 'video', 'outputIndex': 0}]
@@ -71,6 +71,27 @@ class TranscodeExportTest(CallbackTestCase):
         self.create(identifier=first)
         self.assertEqual(self.calls, 2)
         self.assertNotIn('cacheHit', self.service.view(second))
+
+    def test_early_endlist_is_failed_instead_of_becoming_a_completed_song(self):
+        encode = self.service.encoder.execute
+        def truncated(*args):
+            mapping = encode(*args)
+            directory = args[4]
+            playlist = directory / 'stream_0.m3u8'
+            playlist.write_text(playlist.read_text().replace('#EXTINF:60,', '#EXTINF:17.08,'))
+            return mapping
+        identifier = str(uuid.uuid4())
+        with patch.object(self.service.encoder, 'execute', side_effect=truncated):
+            self.create_transcode(self.service, identifier, self.source, 'truncated-song', Target(fmp4=True))
+            for thread in self.service.threads: thread.join(2)
+        view = self.service.view(identifier)
+        self.assertEqual(view['state'], 'FAILED')
+        self.assertIn('Incomplete HLS', view['error'])
+        self.assertFalse((self.service.root / identifier / 'master.m3u8').exists())
+        with self.assertRaises(ComputeError): self.service.export(identifier)
+
+    def test_seeked_output_is_compared_with_the_remaining_duration(self):
+        self.create(Target(start=45, fmp4=True))
 
     def test_export_has_verified_sizes_digests_and_renews_lease(self):
         identifier = self.create()
