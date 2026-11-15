@@ -1,5 +1,4 @@
 **
-!VERSION
 !requirements*.lock
 !singverse_compute/**
 !infra/docker/build/compute/**

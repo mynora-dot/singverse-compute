@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix="singverse-compute-context-") as directo
     context.mkdir()
     shutil.copy2(ROOT / ".dockerignore", context / ".dockerignore")
     fixtures = {
-        "VERSION": "0.1.0", "requirements.lock": "locked",
+        "requirements.lock": "locked",
         "singverse_compute/core/config.py": "source",
         "infra/docker/build/compute/install-opencl.sh": "source",
         ".env": "isolated-fixture", ".tools/private.pem": "isolated-fixture",

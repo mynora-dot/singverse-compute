@@ -1,6 +1,6 @@
 # SingVerse 计算节点
 
-本仓库独立维护 Python/FastAPI 内部媒体和 AI 执行层。源码位于根目录的 singverse_compute，根 VERSION 是产品版本唯一来源；依赖保持 requirements.lock 和各可选运行库锁文件。普通构建和测试不依赖相邻仓库。
+本仓库独立维护 Python/FastAPI 内部媒体和 AI 执行层。源码位于根目录的 singverse_compute，正式版本由 GitHub Release 标签决定并通过 `SINGVERSE_VERSION` 注入，本地开发默认 `0.0.0`；依赖保持 requirements.lock 和各可选运行库锁文件。普通构建和测试不依赖相邻仓库。
 
 ## 独立使用
 
@@ -12,7 +12,7 @@
 
 部署和镜像发布见 [Docker说明](infra/docker/README.md)。本机与容器均不写业务数据库；Go 编排任务、授权媒体回源并保存结果。跨主机部署需要受限网络、认证和双向媒体回源连通。
 
-Go 联动测试必须显式提供 SINGVERSE_TEST_GO_ROOT 与对应的 SINGVERSE_TEST_MACOS_APP_BINARY 或 SINGVERSE_TEST_SEPARATION_APP_BINARY，以及测试需要的模型目录。Go 根目录用于取得迁移与 dbmate，本仓库作为 compute 进程工作目录；不自动搜索兄弟仓库。普通 CI 中真实模型和硬件验收保持明确的 opt-in 条件。
+Go 联动测试必须显式提供 SINGVERSE_TEST_GO_ROOT 与对应的 SINGVERSE_TEST_MACOS_APP_BINARY 或 SINGVERSE_TEST_SEPARATION_APP_BINARY，以及测试需要的模型目录。Go 根目录用于取得迁移与 dbmate，本仓库作为 compute 进程工作目录；不自动搜索兄弟仓库。真实模型和硬件验收在本地按需运行；GitHub Actions 仅在正式 Release 发布后构建并上传镜像，不运行独立测试或 verify。
 
 macOS launchd 启动器独立运行：scripts/macos-compute.py start，默认由节点生成本机凭据并通过 Go 配对；需复用已配置凭据时显式传 --token-file。启动器不会自动读取另一个仓库或容器的凭据。
 
@@ -318,7 +318,7 @@ ROCm 6.2 的现有轮子缺少这台 gfx1103 所需的原生算子库，不能�
 
 Dockerfile 和 OpenCL 安装资源统一位于 `infra/docker/build/`。`make compute-images COMPUTE_RUNTIME=cpu` 构建单个运行库；独立节点源码路线使用 compute 基础配置加 compute-build 覆盖，镜像路线只用基础配置，详见[计算节点部署](infra/docker/GPU.md)。
 
-GHCR、Docker Hub 和阿里云统一通过 `.github/workflows/singverse-compute-images.yml` 发布。Run workflow 可填写 `release_tag` 选择已有正式 Release，并通过 `ghcr_namespace`、`dockerhub_namespace`、`acr_registry`、`acr_namespace` 覆盖本次项目空间；目标参数留空使用仓库 Variables，不填 `release_tag` 只构建检查。部署 `IMAGE_PREFIX` 对应实际仓库域名/命名空间；凭据、镜像地址和不可变标签规则见[镜像发布](infra/docker/README.md)。不再提供业务或计算源码 ZIP、离线镜像 ZIP，模型本身的离线导入能力仍保留。
+GHCR、Docker Hub 和阿里云统一通过 `.github/workflows/singverse-compute-images.yml` 发布。仅在正式 GitHub Release 发布后构建和上传，版本来自标签，项目空间使用仓库 Variables；普通 push/PR 不运行自动检查。部署 `IMAGE_PREFIX` 对应实际仓库域名/命名空间；凭据、镜像地址和不可变标签规则见[镜像发布](infra/docker/README.md)。不再提供业务或计算源码 ZIP、离线镜像 ZIP，模型本身的离线导入能力仍保留。
 
 ### Intel 官方转换模型和离线包
 

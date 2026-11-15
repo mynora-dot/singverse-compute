@@ -4,6 +4,7 @@ import os
 import hashlib
 from functools import lru_cache
 from pathlib import Path
+from singverse_compute._version import __version__
 
 
 def build_info():
@@ -18,12 +19,7 @@ def build_info():
 
 
 def native_version():
-    candidate = Path(__file__).resolve().parents[2] / "VERSION"
-    try:
-        value = candidate.read_text().strip()
-    except OSError:
-        return "development"
-    return value or "development"
+    return os.environ.get("SINGVERSE_VERSION") or __version__
 
 
 @lru_cache(maxsize=1)

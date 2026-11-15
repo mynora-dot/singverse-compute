@@ -21,4 +21,4 @@ include = ["singverse_compute*"]
 "singverse_compute.infrastructure" = ["PANNS_LICENSE.txt"]
 
 [tool.setuptools.dynamic]
-version = {file = ["VERSION"]}
+version = {attr = "singverse_compute._version.__version__"}

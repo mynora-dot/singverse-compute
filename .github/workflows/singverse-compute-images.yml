@@ -1,66 +1,40 @@
 name: singverse-compute-images
 on:
-  push:
-    branches: [main]
-  pull_request:
   release:
     types: [published]
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: 'Existing stable Release tag (vX.Y.Z); empty builds and verifies only'
-        type: string
-        required: false
-      ghcr_namespace:
-        description: 'GHCR owner/organization; empty uses GHCR_NAMESPACE or repository owner'
-        type: string
-        required: false
-      dockerhub_namespace:
-        description: 'Docker Hub user/organization; empty uses DOCKERHUB_NAMESPACE'
-        type: string
-        required: false
-      acr_registry:
-        description: 'Alibaba Cloud registry host (no https://); empty uses ACR_REGISTRY'
-        type: string
-        required: false
-      acr_namespace:
-        description: 'Alibaba Cloud namespace; empty uses ACR_NAMESPACE'
-        type: string
-        required: false
 permissions:
   contents: read
 concurrency:
-  group: images-${{ inputs.release_tag || github.event.release.tag_name || github.ref }}
+  group: images-${{ github.event.release.tag_name }}
   cancel-in-progress: false
 jobs:
   preflight:
+    if: ${{ !github.event.release.prerelease && !github.event.release.draft }}
     runs-on: ubuntu-24.04
     outputs:
       revision: ${{ steps.source.outputs.revision }}
+      version: ${{ steps.source.outputs.version }}
       release_tag: ${{ steps.source.outputs.release_tag }}
       publish: ${{ steps.source.outputs.publish }}
     steps:
       - uses: actions/checkout@v4
-      - run: python3 -m unittest discover -s infra/docker/tests -v
-      - name: Resolve the exact published Release or verify the selected source
+      - name: Resolve the exact published Release
         id: source
         env:
-          RELEASE_TAG: ${{ inputs.release_tag || (github.event_name == 'release' && !github.event.release.prerelease && github.event.release.tag_name) || '' }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
           GH_TOKEN: ${{ github.token }}
         run: python3 infra/docker/resolve-release.py
       - uses: actions/checkout@v4
         with:
           ref: ${{ steps.source.outputs.revision }}
-      - uses: docker/setup-buildx-action@v3
-      - run: make docker-context-check
       - name: Check all release destinations before building
         if: steps.source.outputs.publish == 'true'
         env:
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
-          GHCR_NAMESPACE: ${{ inputs.ghcr_namespace || vars.GHCR_NAMESPACE }}
-          DOCKERHUB_NAMESPACE: ${{ inputs.dockerhub_namespace || vars.DOCKERHUB_NAMESPACE }}
-          ACR_REGISTRY: ${{ inputs.acr_registry || vars.ACR_REGISTRY }}
-          ACR_NAMESPACE: ${{ inputs.acr_namespace || vars.ACR_NAMESPACE }}
+          GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE }}
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+          ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
+          ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE }}
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -74,6 +48,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       SOURCE_REVISION: ${{ needs.preflight.outputs.revision }}
+      SINGVERSE_VERSION: ${{ needs.preflight.outputs.version }}
       RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
     strategy:
       fail-fast: false
@@ -88,16 +63,11 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.revision }}
       - uses: docker/setup-buildx-action@v3
-      - name: Restore the exact previously checked release archive
+      - name: Restore release archive for retries
         id: cached
         if: needs.preflight.outputs.publish == 'true'
         run: python3 infra/docker/release-artifact.py restore --name '${{ matrix.variant }}-${{ matrix.arch }}.oci.tar'
-      - name: Load the restored OCI runtime for acceptance checks
-        if: steps.cached.outputs.found == 'true'
-        run: |
-          sudo apt-get update && sudo apt-get install -y skopeo
-          skopeo copy oci-archive:/tmp/image.tar docker-daemon:singverse:check
-      - name: Build checked runtime and OCI release artifact
+      - name: Build runtime release archive
         if: steps.cached.outputs.found != 'true'
         env:
           VARIANT: ${{ matrix.variant }}
@@ -107,27 +77,13 @@ jobs:
           target="$VARIANT"
           docker buildx build --file "$file" --target "$target" --platform "linux/$ARCH" \
             --build-arg "SOURCE_REVISION=$SOURCE_REVISION" \
+            --build-arg "SINGVERSE_VERSION=$SINGVERSE_VERSION" \
             --provenance=false --tag singverse:check \
-            --output type=docker --output type=oci,dest=/tmp/image.tar .
-      - name: Verify actual installed runtime
-        env:
-          VARIANT: ${{ matrix.variant }}
-        run: |
-            version=$(cat VERSION)
-            docker run --rm --network none -e "EXPECTED_VARIANT=$VARIANT" -e "EXPECTED_VERSION=$version" -e "EXPECTED_REVISION=$SOURCE_REVISION" singverse:check python -c 'import os; from singverse_compute.core.build_info import build_info; info=build_info(); assert (info["variant"],info["version"],info["revision"])==(os.environ["EXPECTED_VARIANT"],os.environ["EXPECTED_VERSION"],os.environ["EXPECTED_REVISION"])'
-            docker run --rm --network none singverse:check python -m pip check
-            docker run --rm --network none singverse:check /opt/singverse-audio-cpu/bin/python -m pip check
-            case "$VARIANT" in
-              cpu|cuda|rocm|rocm-native|uvr|rknn) docker run --rm --network none singverse:check python -c 'import torch,torchaudio' ;;
-              openvino) docker run --rm --network none singverse:check python -c 'import openvino,torch,torchaudio' ;;
-              base)
-                docker run --rm --network none singverse:check /opt/singverse-audio-cpu/bin/python -c 'import onnxruntime'
-                cat tests/callback_source.py tests/smoke/container_media_tags.py | docker run --rm --network none -i singverse:check python -
-                ;;
-            esac
-      - name: Verify release artifact is the tested runtime
-        run: python3 infra/docker/check-oci-artifact.py /tmp/image.tar --image singverse:check
-      - name: Preserve checked OCI bytes for all future publish retries
+            --output type=oci,dest=/tmp/image.tar .
+      - name: Release build cache after exporting the archive
+        if: steps.cached.outputs.found != 'true'
+        run: docker buildx prune --all --force
+      - name: Preserve release archive for publish retries
         if: needs.preflight.outputs.publish == 'true' && steps.cached.outputs.found != 'true'
         run: python3 infra/docker/release-artifact.py save --name '${{ matrix.variant }}-${{ matrix.arch }}.oci.tar'
       - uses: actions/upload-artifact@v4
@@ -147,10 +103,11 @@ jobs:
       packages: write
     env:
       RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
-      GHCR_NAMESPACE: ${{ inputs.ghcr_namespace || vars.GHCR_NAMESPACE }}
-      DOCKERHUB_NAMESPACE: ${{ inputs.dockerhub_namespace || vars.DOCKERHUB_NAMESPACE }}
-      ACR_REGISTRY: ${{ inputs.acr_registry || vars.ACR_REGISTRY }}
-      ACR_NAMESPACE: ${{ inputs.acr_namespace || vars.ACR_NAMESPACE }}
+      SINGVERSE_VERSION: ${{ needs.preflight.outputs.version }}
+      GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE }}
+      DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+      ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
+      ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE }}
       GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
       GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}

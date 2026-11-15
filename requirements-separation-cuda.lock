@@ -3,7 +3,7 @@ numpy==1.26.4
 soundfile==0.13.1
 cffi==2.1.1
 pycparser==2.22
-onnxruntime-gpu==1.20.1
+onnxruntime-gpu==1.20.2
 coloredlogs==15.0.1
 humanfriendly==10.0
 flatbuffers==25.12.19
