@@ -112,6 +112,99 @@ class ReleaseTests(unittest.TestCase):
                 release.publish(Path('/unused'))
             copy.assert_not_called()
 
+    def test_release_archives_are_bounded_to_one_runtime_and_cleaned_before_latest(self):
+        raw = json.dumps({'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.manifest.v1+json'}).encode()
+        roots = []
+        restored = []
+        events = []
+
+        def restore(args, check):
+            archive = Path(args[-1])
+            root = archive.parents[1]
+            if root not in roots:
+                self.assertTrue(all(not previous.exists() for previous in roots))
+                roots.append(root)
+            self.assertTrue(check)
+            self.assertEqual(args[2:5], ['restore', '--name', archive.parent.name + '.oci.tar'])
+            archive.parent.mkdir(parents=True)
+            archive.write_bytes(b'checked archive')
+            restored.append(archive.parent.name)
+
+        def layout(directory, variant, raw, destination):
+            self.assertEqual(directory, roots[-1])
+            self.assertEqual({path.name for path in directory.iterdir()},
+                             {f'{variant}-{arch}' for arch in release.VARIANTS[variant]})
+
+        def copy(*args):
+            self.assertTrue(all(not root.exists() for root in roots))
+            events.append(('latest', args[-1]))
+
+        with patch.dict(release.os.environ, self.env(), clear=True), \
+             patch.object(release, 'VARIANTS', {'base': ['amd64', 'arm64'], 'cuda': ['amd64']}), \
+             patch.object(release.subprocess, 'run', side_effect=restore), \
+             patch.object(release.subprocess, 'check_output', return_value=raw), \
+             patch.object(release, 'ensure', side_effect=lambda ref, digest, publish: events.append(('fixed', ref))), \
+             patch.object(release, 'layout', side_effect=layout), patch.object(release, 'run', side_effect=copy):
+            release.publish(Path('/unused'), from_release=True)
+
+        self.assertEqual(restored, ['base-amd64', 'base-arm64', 'cuda-amd64'])
+        self.assertEqual(len(roots), 2)
+        self.assertEqual([event[0] for event in events], ['fixed'] * 15 + ['latest'] * 6)
+        self.assertTrue(all(not root.exists() for root in roots))
+
+    def test_missing_release_archive_stops_publishing_and_cleans_downloads(self):
+        roots = []
+
+        def restore(args, check):
+            archive = Path(args[-1])
+            roots.append(archive.parents[1])
+            archive.parent.mkdir(parents=True)
+
+        with patch.dict(release.os.environ, self.env(), clear=True), \
+             patch.object(release.subprocess, 'run', side_effect=restore), patch.object(release, 'ensure') as publish:
+            with self.assertRaisesRegex(ValueError, 'Missing immutable Release archive'):
+                release.publish(Path('/unused'), from_release=True)
+        publish.assert_not_called()
+        self.assertTrue(all(not root.exists() for root in roots))
+
+    def test_failed_restore_cleans_downloads_and_never_rebuilds(self):
+        roots = []
+
+        def restore(args, check):
+            archive = Path(args[-1])
+            roots.append(archive.parents[1])
+            archive.parent.mkdir(parents=True)
+            archive.write_bytes(b'interrupted download')
+            raise subprocess.CalledProcessError(1, args)
+
+        with patch.dict(release.os.environ, self.env(), clear=True), \
+             patch.object(release.subprocess, 'run', side_effect=restore) as commands, \
+             patch.object(release, 'ensure') as publish:
+            with self.assertRaises(subprocess.CalledProcessError):
+                release.publish(Path('/unused'), from_release=True)
+        commands.assert_called_once()
+        publish.assert_not_called()
+        self.assertTrue(all(not root.exists() for root in roots))
+
+    def test_later_runtime_failure_does_not_update_any_latest(self):
+        raw = json.dumps({'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.manifest.v1+json'}).encode()
+        fixed = []
+
+        def ensure(ref, digest, publish):
+            fixed.append(ref)
+            if ref.endswith('-cuda'):
+                raise RuntimeError('later runtime failed')
+
+        with patch.dict(release.os.environ, self.env(), clear=True), \
+             patch.object(release, 'VARIANTS', {'base': ['amd64'], 'cuda': ['amd64']}), \
+             patch.object(release.subprocess, 'check_output', return_value=raw), \
+             patch.object(release, 'ensure', side_effect=ensure), patch.object(release, 'layout'), \
+             patch.object(release, 'run') as copy:
+            with self.assertRaisesRegex(RuntimeError, 'later runtime failed'):
+                release.publish(Path('/unused'))
+        self.assertTrue(any(ref.endswith('-base') for ref in fixed))
+        copy.assert_not_called()
+
     def test_oci_layout_preserves_blob_bytes_and_deterministic_index(self):
         raw = release.manifest([])
         data = b'checked image content'

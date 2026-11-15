@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Publish checked OCI artifacts without rebuilding; refuse different immutable tags."""
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -99,38 +100,59 @@ def layout(directory, variant, raw, destination):
     (destination / 'index.json').write_text(json.dumps({'schemaVersion': 2, 'manifests': [descriptor]}))
 
 
-def publish(directory):
+@contextmanager
+def variant_artifacts(directory, variant, from_release):
+    """Keep only one runtime's archives on disk while publishing a Release."""
+    if not from_release:
+        yield directory
+        return
+    with tempfile.TemporaryDirectory(prefix='singverse-archives-') as temporary:
+        source = Path(temporary)
+        for arch in VARIANTS[variant]:
+            name = f'{variant}-{arch}'
+            archive = source / name / 'image.tar'
+            print('Restoring Release archive: ' + name, flush=True)
+            subprocess.run([sys.executable, str(ROOT / 'infra/docker/release-artifact.py'),
+                            'restore', '--name', name + '.oci.tar', '--archive', str(archive)], check=True)
+            if not archive.is_file():
+                raise ValueError('Missing immutable Release archive: ' + name)
+        yield source
+
+
+def publish(directory, from_release=False):
     version, prefixes = config()
-    records = {}
-    # Publish architecture images first. Each artifact was built and tested once.
+    records = []
+    # Finish each runtime's immutable tags before releasing its local archives.
     for variant, arches in VARIANTS.items():
         image = 'singverse-compute'
         suffix = '-' + variant
-        entries = []
-        for arch in arches:
-            archive = directory / f'{variant}-{arch}' / 'image.tar'
-            raw = subprocess.check_output(['skopeo', 'inspect', '--raw', 'oci-archive:' + str(archive)])
+        print('Publishing runtime: ' + variant, flush=True)
+        with variant_artifacts(directory, variant, from_release) as source:
+            entries = []
+            for arch in arches:
+                archive = source / f'{variant}-{arch}' / 'image.tar'
+                raw = subprocess.check_output(['skopeo', 'inspect', '--raw', 'oci-archive:' + str(archive)])
+                digest = 'sha256:' + hashlib.sha256(raw).hexdigest()
+                descriptor = {'mediaType': json.loads(raw)['mediaType'], 'digest': digest, 'size': len(raw),
+                              'platform': {'os': 'linux', 'architecture': arch}}
+                entries.append(descriptor)
+                for prefix in prefixes:
+                    ref = f'{prefix}/{image}:{version}{suffix}-{arch}'
+                    ensure(ref, digest, lambda ref=ref, archive=archive: run('skopeo', 'copy', '--all', '--preserve-digests',
+                           'oci-archive:' + str(archive), 'docker://' + ref))
+            # Keep index bytes and digests identical at all destinations.
+            raw = manifest(entries)
             digest = 'sha256:' + hashlib.sha256(raw).hexdigest()
-            descriptor = {'mediaType': json.loads(raw)['mediaType'], 'digest': digest, 'size': len(raw),
-                          'platform': {'os': 'linux', 'architecture': arch}}
-            entries.append(descriptor)
-            for prefix in prefixes:
-                ref = f'{prefix}/{image}:{version}{suffix}-{arch}'
-                ensure(ref, digest, lambda ref=ref, archive=archive: run('skopeo', 'copy', '--all', '--preserve-digests',
-                       'oci-archive:' + str(archive), 'docker://' + ref))
-        records[(image, suffix)] = (variant, manifest(entries))
-    # Copy deterministic OCI indexes, keeping bytes and digests identical at all destinations.
-    for (image, suffix), (variant, raw) in records.items():
-        digest = 'sha256:' + hashlib.sha256(raw).hexdigest()
-        with tempfile.TemporaryDirectory(prefix='singverse-release-') as temporary:
-            destination = Path(temporary) / 'layout'
-            layout(directory, variant, raw, destination)
-            for prefix in prefixes:
-                ref = f'{prefix}/{image}:{version}{suffix}'
-                ensure(ref, digest, lambda ref=ref: run('skopeo', 'copy', '--all', '--preserve-digests',
-                       'oci:' + str(destination) + ':release', 'docker://' + ref))
+            with tempfile.TemporaryDirectory(prefix='singverse-release-') as temporary:
+                destination = Path(temporary) / 'layout'
+                layout(source, variant, raw, destination)
+                for prefix in prefixes:
+                    ref = f'{prefix}/{image}:{version}{suffix}'
+                    ensure(ref, digest, lambda ref=ref: run('skopeo', 'copy', '--all', '--preserve-digests',
+                           'oci:' + str(destination) + ':release', 'docker://' + ref))
+            records.append((image, suffix))
     # No latest tag is changed until every immutable version passed validation.
-    for (image, suffix), (_, raw) in records.items():
+    for image, suffix in records:
         for prefix in prefixes:
             run('skopeo', 'copy', '--all', '--preserve-digests',
                 f'docker://{prefix}/{image}:{version}{suffix}', f'docker://{prefix}/{image}:latest{suffix}')
@@ -140,10 +162,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('validate', 'publish'))
     parser.add_argument('--artifacts', type=Path, default=Path('artifacts'))
+    parser.add_argument('--from-release', action='store_true',
+                        help='Restore and clean up one runtime at a time from immutable Release assets')
     args = parser.parse_args()
     version, _ = config()
     if args.command == 'publish':
-        publish(args.artifacts)
+        publish(args.artifacts, from_release=args.from_release)
     print('Validated release ' + version)
 
 

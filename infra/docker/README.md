@@ -51,3 +51,5 @@ make docker-up
 ## 可恢复的发布归档
 
 正式发布在 GitHub Release 保存每个运行库和架构的 OCI 归档。逻辑名为 `${runtime}-${arch}.oci.tar`；实际使用 1 GiB 内容寻址分片，最后发布 `.oci.tar.json` 清单，包含整包及每片的长度和 SHA-256，适配 GitHub 单资产大小限制。重试先校验归档长度与摘要并恢复同一内容，再发布到镜像仓库。中断上传的分片可复用，固定内容从不覆盖；查询失败不会被当成缓存缺失。脚本入口：`python3 infra/docker/release-artifact.py restore|save --name base-amd64.oci.tar --archive /tmp/image.tar`，需要 GH_TOKEN、GITHUB_REPOSITORY 与 RELEASE_TAG，版本由该 Release 标签决定。
+
+发布任务执行 `python3 infra/docker/release.py publish --from-release`，每次只恢复一个运行库所需的架构归档，完成三个镜像仓库的固定架构标签及多架构索引后清理本地文件，再处理下一个运行库。全部固定版本成功后统一更新 `latest-<runtime>`，避免一次下载全部 CUDA、ROCm 等大归档耗尽 runner 磁盘。不再重复上传 Actions artifacts；Release 分片归档作为重试来源，缺失或损坏即停止发布，不在发布阶段重新构建。
