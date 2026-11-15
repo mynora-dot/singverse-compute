@@ -73,7 +73,7 @@ class AudioRoles:
         self.native_worker = None
         if (audio_runtime_profile() in ('rocm-native', 'legacy') or self.settings.audio_cpu_python) and self.settings.audio_worker_idle_seconds:
             from ..infrastructure.audio_worker import AudioWorker
-            self.native_worker = AudioWorker(lambda key: [self.cpu_python() if key[0] == 'cpu' else sys.executable, '-m',
+            self.native_worker = AudioWorker(lambda key: [self.inference_python(key[0]), '-m',
                 'singverse_compute.infrastructure.rocm_audio', '--worker', '--model-dir', str(self.repo),
                 '--output', str(self.root), '--backend', key[0]], env=self._environment(),
                 memory_limit=self.settings.audio_memory_bytes, idle_seconds=self.settings.audio_worker_idle_seconds)
@@ -224,6 +224,12 @@ class AudioRoles:
     def cpu_python(self):
         return str(getattr(self.settings, 'audio_cpu_python', None) or sys.executable)
 
+    def inference_python(self, backend):
+        if backend == 'cpu':
+            return str(getattr(getattr(self, 'settings', None), 'audio_cpu_python', None) or sys.executable)
+        environment = getattr(getattr(self, 'models', None), 'environment', None) or {}
+        return environment.get('rocmPython', sys.executable) if backend == 'rocm' else sys.executable
+
     def cpu_runtime(self, refresh=False):
         """Legacy CPU is optional alongside ORT, but never borrowed from a CUDA/HIP wheel."""
         if not hasattr(self, '_legacy_cpu_environment') or refresh:
@@ -252,7 +258,7 @@ class AudioRoles:
         import stat
         if not stat.S_ISREG(info.st_mode):
             raise ComputeError(422, 'Expected a regular official model file')
-        return backend, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+        return backend, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, self.inference_python(backend)
 
     @contextmanager
     def stage(self, task, name):
@@ -399,6 +405,7 @@ class AudioRoles:
 
     def _separate_once(self, wav: Path, output: Path, task: AudioTask):
         backend = getattr(task, 'backend', 'cpu')
+        python = AudioRoles.inference_python(self, backend)
         if backend == 'cpu' and getattr(self.settings, 'audio_cpu_python', None) and not getattr(self, 'native_worker', None):
             self._run([self.cpu_python(), '-m', 'singverse_compute.infrastructure.rocm_audio',
                        '--model-dir', str(self.repo), '--output', str(output), '--backend', 'cpu',
@@ -424,7 +431,8 @@ class AudioRoles:
         elif backend == 'mps' and not getattr(self, 'native_worker', None):
             self._run([sys.executable, '-m', 'singverse_compute.infrastructure.mps_audio',
                        '--model-dir', str(self.repo), '--output', str(output), str(wav)], task)
-        elif backend in ('rocm', 'cpu', 'cuda', 'mps') and (audio_runtime_profile() == 'rocm-native' or getattr(self, 'native_worker', None)):
+        elif backend in ('rocm', 'cpu', 'cuda', 'mps') and (audio_runtime_profile() == 'rocm-native'
+                or getattr(self, 'native_worker', None) or backend == 'rocm' and python != sys.executable):
             backing_only = getattr(task, 'mode', '') == 'SEPARATE'
             native = getattr(self, 'native_worker', None)
             if native:
@@ -432,7 +440,7 @@ class AudioRoles:
                     {'op': 'separate', 'source': str(wav), 'output': str(output), 'backingOnly': backing_only},
                     cancel=task.cancel, event=lambda value: self.inference_event(task, value))
             else:
-                self._run([sys.executable, '-m', 'singverse_compute.infrastructure.rocm_audio',
+                self._run([python, '-m', 'singverse_compute.infrastructure.rocm_audio',
                            '--model-dir', str(self.repo), '--output', str(output), '--backend', backend,
                            *(['--backing-only'] if backing_only else []), str(wav)], task)
         else:
@@ -511,6 +519,8 @@ class AudioRoles:
             raise ComputeError(400, 'Invalid audio task')
         from ..domain.audio_separation import LEGACY, recipe
         enhanced = mode == 'SEPARATE' and (separation_profile not in (None, LEGACY) or source_audio_id is not None)
+        if backend in ('cpu', 'openvino-cpu') and mode in ('ANALYZE', 'SEPARATE') and source_audio_id is None and separation_profile != 'DSP_FAST':
+            raise ComputeError(422, 'CPU 仅用于加速失败后的自动降级，请选择 auto 或加速设备')
         specification = None
         extra = separation_profile is not None or model_id is not None or output_format != 'aac' or preview or source_audio_id is not None
         if extra:

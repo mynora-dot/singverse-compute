@@ -84,6 +84,25 @@ class AudioRuntimeProfileTest(unittest.TestCase):
             self.assertEqual(command[2], 'demucs')
             self.assertEqual(command[command.index('-d') + 1], 'cuda')
 
+    def test_combined_rocm_image_dispatches_gfx1103_without_a_resident_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            folder = output/'htdemucs'/'input'
+            folder.mkdir(parents=True)
+            (folder/'no_vocals.wav').touch()
+            python = '/opt/singverse-audio-rocm-gfx1103/bin/python'
+            worker = SimpleNamespace(repo=Path('/model'), settings=SimpleNamespace(audio_cpu_python=None),
+                                     models=SimpleNamespace(environment={'rocmPython': python}),
+                                     native_worker=None, _run=Mock())
+            with patch('singverse_compute.application.audio_roles.audio_runtime_profile', return_value='legacy'):
+                AudioRoles._separate_once(worker, Path('input.wav'), output,
+                                         SimpleNamespace(backend='rocm', mode='SEPARATE'))
+            command = worker._run.call_args.args[0]
+            self.assertEqual(command[0], python)
+            self.assertIn('singverse_compute.infrastructure.rocm_audio', command)
+            self.assertEqual(command[command.index('--backend') + 1], 'rocm')
+            self.assertIn('--backing-only', command)
+
 
 @unittest.skipUnless(importlib.util.find_spec('torch'), 'Optional audio runtime required')
 class NativeAudioAdapterTest(unittest.TestCase):

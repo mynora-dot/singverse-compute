@@ -38,6 +38,7 @@ class RecipeTest(unittest.TestCase):
                                      'openvino': SimpleNamespace(Core=CpuCore)}), \
              patch('singverse_compute.infrastructure.separation_worker.version', side_effect=package), \
              patch('singverse_compute.infrastructure.separation_worker.platform.system', return_value='Linux'), \
+             patch('singverse_compute.infrastructure.separation_worker.platform.processor', return_value='CPU'), \
              patch('subprocess.run', side_effect=AssertionError('CPU probe ran a GPU command')):
             result = probe(cpu_only=True)
         self.assertTrue(result['standaloneCpu'])
@@ -81,6 +82,25 @@ class RecoveryTest(unittest.TestCase):
         self.assertEqual(engine.admit(CLEAN, 'cuda'), 'cpu')
         engine.audio.transcoding.backends.cpu_fallback = False
         with self.assertRaises(ComputeError): engine.admit(CLEAN, 'cuda')
+
+    def test_cpu_is_not_a_user_selectable_ai_backend(self):
+        engine = SeparationEngine.__new__(SeparationEngine)
+        for backend in ('cpu', 'openvino-cpu'):
+            with self.subTest(backend=backend), self.assertRaisesRegex(ComputeError, 'CPU'):
+                engine.admit(CLEAN, backend)
+        self.assertEqual(engine.admit(DSP, 'cpu'), 'cpu')
+        self.assertEqual(engine.admit(CLEAN, 'cpu', 'stream:1'), 'cpu')
+
+    def test_auto_cpu_fallback_stops_when_policy_is_disabled(self):
+        engine = SeparationEngine.__new__(SeparationEngine)
+        engine.audio = SimpleNamespace(transcoding=SimpleNamespace(backends=SimpleNamespace(cpu_fallback=False)))
+        engine.entries = Mock(return_value=[{'id': 'cpu', 'state': 'AVAILABLE'}])
+        self.assertIsNone(engine.selected())
+        self.assertEqual(engine.selected('cpu'), 'cpu', 'Internal qualification/recovery can still select CPU explicitly')
+        engine.audio.transcoding.backends.cpu_fallback = True
+        self.assertEqual(engine.selected(), 'cpu')
+        engine.entries.return_value.append({'id': 'cuda', 'state': 'AVAILABLE'})
+        self.assertEqual(engine.selected(), 'cuda')
 
     def test_qualification_identity_is_bound_to_backend_even_in_same_environment(self):
         engine = SeparationEngine.__new__(SeparationEngine)

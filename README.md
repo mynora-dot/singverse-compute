@@ -181,7 +181,7 @@ make compute-fast-audio-setup
 .venv/bin/python scripts/macos-compute.py restart
 ```
 
-复用固定 `requirements-audio.lock` 中的 Torch 2.5.1 / NumPy 1.26.4，不引入 TensorFlow 或在线推理服务；安装此目标只下载分类权重，不下载 Demucs 分离权重。现有音频运行环境已满足时，也可仅在“性能节点配置 → 伴奏模型”下载快速人声分类模型。PANNs 权重独立存放在 `COMPUTE_AUDIO_MODEL_REPO` 同级 `panns-cnn6/Cnn6_mAP=0.343.pth`，脚本默认 `.tools/panns-cnn6`；自定义目录使用 `scripts/setup-fast-audio-model.py --directory <绝对路径>`。缺少路径时需先配置模型目录；不会在扫描时自动联网安装。Docker 使用已有固定音频运行库镜像（如设置 `COMPUTE_RUNTIME=cpu`），随后在网页下载快速分类模型；快速识别不要求下载 Demucs 权重或完成分离设备试跑。原生 setup 命令不能替换正在运行的容器环境。
+复用固定 `requirements-audio.lock` 中的 Torch 2.5.1 / NumPy 1.26.4，不引入 TensorFlow 或在线推理服务；安装此目标只下载分类权重，不下载 Demucs 分离权重。现有音频运行环境已满足时，也可仅在“性能节点配置 → 伴奏模型”下载快速人声分类模型。PANNs 权重独立存放在 `COMPUTE_AUDIO_MODEL_REPO` 同级 `panns-cnn6/Cnn6_mAP=0.343.pth`，脚本默认 `.tools/panns-cnn6`；自定义目录使用 `scripts/setup-fast-audio-model.py --directory <绝对路径>`。缺少路径时需先配置模型目录；不会在扫描时自动联网安装。Docker 按硬件使用四种固定加速运行库镜像（如 NVIDIA 设置 `COMPUTE_RUNTIME=cuda`），随后在网页下载快速分类模型；快速识别不要求下载 Demucs 权重或完成分离设备试跑。原生 setup 命令不能替换正在运行的容器环境。
 
 作者发行版 Zenodo 3987831，23,698,321 字节，SHA-256 `8a17541944f2623a2a0164e072ac2f915dcedca99968083cc44bfbc7eb682275`；权重 CC BY 4.0，归属 Qiuqiang Kong 等，PANNs: Large-Scale Pretrained Audio Neural Networks for Audio Pattern Recognition。网络结构适配固定修订 `d2f4b8c18eab44737fcc0de1248ae21eb43f6aa4` 的 Cnn6；MIT 归属见 `singverse_compute/infrastructure/PANNS_LICENSE.txt`。加载前检查固定体积及完整摘要，使用 `weights_only=True`，不执行上传模型代码。离线导入接受只含此 PTH 文件的根目录 ZIP，上限 32MiB；保留下载/导入/取消及原子安装规则。
 
@@ -213,7 +213,7 @@ SINGVERSE_TEST_FAST_MODEL_REPO="$PWD/.tools/demucs-htdemucs" \
 - 音频任务一次一个，CPU 线程默认按有效核心与配额自动选择（最多 8，RK3566 初值最多 2）、进程 RSS 上限 4 GiB（`COMPUTE_AUDIO_THREADS`、`COMPUTE_AUDIO_MEMORY_BYTES`），共享磁盘预算及最小空余限制，超时 2 小时。实时播放先终止音频任务，再重试获取执行容量；音频任务不能进入实时预留期间。compute被抢占任务显示 CANCELLED / REALTIME_PREEMPTED，Go记录为失败，批量页面可显式重试；默认开启的统一 CPU 自动降级仅对明确的加速后端故障重试一次，记录实际设备及原因；关闭后不切换。无效媒体、磁盘不足、取消和进程内存预算错误不重试。
 - Go 校验下载的产物后保存至自己的衍生目录，确认成功后释放 compute 副本；未收到确认的 compute 音频在后续任务回收时保留最长一天。不要把衍生目录放入原始媒体目录。
 
-Go 仓库的组合 Compose 默认不启用计算容器或下载模型；启用后使用持久卷保存模型和设置。CPU 分离选择 `COMPUTE_RUNTIME=cpu`，按源码或镜像路线重建/拉取并启动，再从网页下载模型和试跑。容器默认 6GiB、音频进程默认 4GiB，原始媒体保持只读。
+Go 仓库的组合 Compose 默认不启用计算容器或下载模型；启用后使用持久卷保存模型和设置。按硬件选择 `cuda`、`rocm`、`openvino` 或 `rknn`，按源码或镜像路线重建/拉取并启动，再从网页下载模型并分别验证加速与 CPU 自动降级。容器默认 6GiB、音频进程默认 4GiB，原始媒体保持只读。
 
 ### Mac 原生伴奏节点
 
@@ -272,25 +272,24 @@ SINGVERSE_TEST_GO_ROOT="/path/to/go-backend" SINGVERSE_TEST_SEPARATION_APP_BINAR
 
 容器仅有源码构建与预构建镜像两条路线，运行库与设备映射分开配置，见[硬件与计算节点](infra/docker/GPU.md)。模型、驱动及真实歌曲资格需在目标主机分别验收。
 
-## 分设备计算镜像（CPU／CUDA／ROCm／OpenVINO）
+## 分设备计算镜像与 Mac 原生包
 
 镜像按推理后端划分，不按处理器型号命名。compute 使用独立的 `COMPUTE_VERSION`，不要求与 Go 版本一致：
 
 | 标签后缀 | 架构 | 环境 | 设备验收状态 |
 |---|---|---|---|
-| `-cpu` | linux/amd64、linux/arm64 | Torch 2.5.1 CPU、Demucs 4.0.1 | ARM64 镜像本次构建通过；各设备音乐效果与长曲分别记录 |
 | `-cuda` | linux/amd64 | Torch 2.5.1+cu124 | 各设备需重新试跑及完整歌曲验收 |
-| `-rocm` | linux/amd64 | Torch 2.5.1+rocm6.2 | AMD APU 按实际 GPU 标识与运行时验证，不能由型号推定兼容 |
-| `-rocm-native` | linux/amd64、Python 3.12 | Torch 2.11.0+rocm10.0.0、gfx1103 设备库 | Radeon 780M 单机实测见 [ROCm 记录](https://github.com/mynora-dot/singverse-go-backend/blob/main/docs/verification-rocm-2026-11-08.md)；不泛化到其它 GPU |
+| `-rocm` | linux/amd64 | Torch 2.5.1+rocm6.2；隔离的 Torch 2.11.0+rocm10.0.0 / gfx1103 设备库 | 按实际设备选择运行库；保留原 Radeon 780M 适配，合并后的镜像仍需真机验收 |
 | `-openvino` | linux/amd64 | OpenVINO 2025.4.0、CPU Torch 2.5.1、固定 Intel OpenCL 用户态库 | N100／8400T 分别待真机验证 |
+| `-rknn` | linux/arm64 | RKNN Lite 2.3.2、ONNX/DSP 依赖 | 要求匹配的 BSP、运行库和转换模型，需目标设备试跑 |
 
-CPU 镜像由 Docker 清单选择 amd64／arm64，GPU 后端需要显式选择。RKNN 已有单台 RK3566 的转换及隔离 NPU 全曲记录，尚未发布通用转换权重或经过默认隔离验收的 `-rknn` 镜像；RK3566 可验证 ARM64 CPU，资源不足时阻止任务。M2 使用 macOS 原生环境及下述 MPS 分块适配器。视频转码后端与 AI 推理后端独立检测，QSV 可用不等于 OpenVINO 可用。
+每个版本只发布四个固定版本标签与四个 `latest-<运行库>`，例如 `0.0.2-cuda` / `latest-cuda`，不再单发架构、base、cpu、uvr 或 rocm-native 标签。四种镜像均内置独立 CPU 降级环境；按共享开关在加速不可用或执行失败时自动使用，不是独立的部署或手动设备选项。历史版本不会自动删除。Mac ARM64 在同一 Release 下载[原生安装包](MACOS.md)，使用 MPS / MLX / VideoToolbox，不增加 Docker 标签。视频与 AI 后端独立检测，QSV 可用不等于 OpenVINO 可用。
 
 ### gfx1103 原生 ROCm 与固件
 
-`rocm-native` 是独立配置，SDK 包版本为 10.0.0，实际 `torch.version.hip` 为 7.15.26333。锁文件直接固定官方 AMD 仓库的已测试文件和实测完整 SHA256；AMD 未提供这些文件的完整摘要，不能把本地计算的摘要称为厂商校验和。共享依赖从 `requirements-audio-dependencies.lock` 读取，旧配置仍固定 SymPy 1.13.1，原生配置按 Torch 要求单独固定 1.13.3。
+gfx1103 原生配置已合并进公开的 `rocm` 镜像内部，使用独立 Python 环境避免与通用 ROCm 依赖冲突。设备探测确认真实 gfx1103 后，试跑、显存查询和任务执行统一使用该解释器；其他 AMD GPU 使用原通用 ROCm 环境。SDK 包版本为 10.0.0，实际 `torch.version.hip` 为 7.15.26333。锁文件保留官方 AMD 仓库的已测试文件和实测完整 SHA256；共享依赖和两个配置的不同 SymPy 固定版本继续隔离。
 
-显式构建使用 `make compute-images COMPUTE_RUNTIME=rocm-native`，随后按统一硬件指南追加 `compose.rocm.yaml`，设置实际 render/video 组 ID。该运行库使用可写 `/tmp` HOME 和明确用户名，兼容性及资源门槛仍需真机验证。
+显式构建使用 `make compute-images COMPUTE_RUNTIME=rocm`，随后按统一硬件指南追加 `compose.rocm.yaml`，设置实际 render/video 组 ID。该运行库使用可写 `/tmp` HOME 和明确用户名，兼容性及资源门槛仍需真机验证。
 
 该配置通过专用适配器读取既有官方权重与 44.1kHz 双声道 PCM，保持模型原始 7.8 秒分段、0.25 重叠和 shifts=0。每次工作进程从同一已核验大小/SHA256的文件描述符加载官方 checkpoint，局部使用 `weights_only=False`，不全局修改 Torch 加载行为；音频读写使用 SoundFile，避免新 torchaudio 对额外 TorchCodec 的要求。实际模型参数和每次 forward 的输入/输出必须留在指定设备；GPU 不可用或架构不符立即失败，不在适配器内隐式转 CPU。CPU 仅接受显式选择或上层已有的、带结果标记的降级流程。
 
@@ -316,7 +315,7 @@ ROCm 6.2 的现有轮子缺少这台 gfx1103 所需的原生算子库，不能�
 
 ### 本地构建与预构建镜像
 
-Dockerfile 和 OpenCL 安装资源统一位于 `infra/docker/build/`。`make compute-images COMPUTE_RUNTIME=cpu` 构建单个运行库；独立节点源码路线使用 compute 基础配置加 compute-build 覆盖，镜像路线只用基础配置，详见[计算节点部署](infra/docker/GPU.md)。
+Dockerfile 和 OpenCL 安装资源统一位于 `infra/docker/build/`。`make compute-images COMPUTE_RUNTIME=cuda` 构建单个运行库（按硬件选择四种变体）；独立节点源码路线使用 compute 基础配置加 compute-build 覆盖，镜像路线只用基础配置，详见[计算节点部署](infra/docker/GPU.md)。
 
 GHCR、Docker Hub 和阿里云统一通过 `.github/workflows/singverse-compute-images.yml` 发布。仅在正式 GitHub Release 发布后构建和上传，版本来自标签，项目空间使用仓库 Variables；普通 push/PR 不运行自动检查。部署 `IMAGE_PREFIX` 对应实际仓库域名/命名空间；凭据、镜像地址和不可变标签规则见[镜像发布](infra/docker/README.md)。不再提供业务或计算源码 ZIP、离线镜像 ZIP，模型本身的离线导入能力仍保留。
 
@@ -345,7 +344,7 @@ SINGVERSE_TEST_OPENVINO_MODEL_REPO=/absolute/path/to/.tools/htdemucs-openvino \
 
 官方参考：Immich 的硬件镜像与远程 ML 文档、Intel `demucs-openvino` 模型库。镜像构建、合成音试跑不替代真实歌曲质量、长曲、NAS 和对应 GPU 真机验收。
 
-模型状态查询共用一次后端快照。RKNN 权重校验按 manifest 与模型的设备、inode、大小、mtime／ctime 缓存，使用独立锁避免等待环境探测；文件变化立即失效，实际执行前仍重新验证完整摘要。视频转码与伴奏推理共用节点 `hardware-settings.json` 的 `cpuFallback`，旧配置默认开启；通过现有硬件设置 API 保存并校验 revision，只对新任务生效。返回 `detectedBackends`，音频后端返回 `detected` 区分物理存在与运行就绪；仅安装编码器不算硬件存在。允许主动选择已合格的 CPU，不再因发现加速硬件而拒绝。降级须满足 CPU 运行条件，推理还需独立试跑；任务结果记录 `fallbackReason`。HLS 已发布播放清单后不切换后端。
+模型状态查询共用一次后端快照。RKNN 权重校验按 manifest 与模型的设备、inode、大小、mtime／ctime 缓存，使用独立锁避免等待环境探测；文件变化立即失效，实际执行前仍重新验证完整摘要。视频转码与伴奏推理共用节点 `hardware-settings.json` 的 `cpuFallback`，旧配置默认开启；通过现有硬件设置 API 保存并校验 revision，只对新任务生效。返回 `detectedBackends`，音频后端返回 `detected` 区分物理存在与运行就绪；仅安装编码器不算硬件存在。AI 推理只提供自动或加速设备选择，CPU 仅用于自动降级；关闭降级后，即使未检测到加速设备也不会自动使用 CPU。降级须满足 CPU 运行条件，推理还需独立试跑；任务结果记录 `fallbackReason`。HLS 已发布播放清单后不切换后端。
 
 节点启动后在后台检测推理环境，自动为已安装模型的未验证设备执行一次真实分离试跑，优先加速设备；允许 CPU 自动降级时同时验证 CPU。复用当前环境与权重仍匹配的资格，不自动下载模型，也不循环重试已失败的设备；缺失依赖或模型继续给出配置原因。实时播放或模型操作占用时等待，取消试跑或停止节点会中止后续自动检查。模型状态返回 `startupCheck`（检测、等待、试跑、完成、失败或取消）；启动健康检查不等待模型推理完成。
 
@@ -390,7 +389,7 @@ python scripts/convert-rknn-audio.py \
 
 ### RK3566 Docker 部署
 
-使用统一 compute 配置，CPU 基线选择 `COMPUTE_RUNTIME=uvr`；NPU 选择 `COMPUTE_RUNTIME=rknn` 并追加 `compose.rknn.yaml`。准备匹配的 BSP、运行库、设备权限及已验证模型目录，详见[硬件指南](infra/docker/GPU.md)。不提供单独的板卡部署包，模型转换工具和原生部署步骤仍保留。
+使用统一 compute 配置，选择 `COMPUTE_RUNTIME=rknn` 并追加 `compose.rknn.yaml`；镜像内置 CPU 自动降级环境。准备匹配的 BSP、运行库、设备权限及已验证模型目录，详见[硬件指南](infra/docker/GPU.md)。不提供单独的板卡部署包，模型转换工具和原生部署步骤仍保留。
 
 ## 跨平台快速伴奏引擎（2026-11-09）
 

@@ -21,7 +21,7 @@ from array import array
 from urllib.request import urlopen
 
 from ..core.errors import ComputeError
-from .audio_roles import AudioTask, _rms
+from .audio_roles import AudioRoles, AudioTask, _rms
 
 NAME = '955717e8-8726e21a.th'
 DIGEST = '8726e21a993978c7ba086d3872e7608d7d5bfca646ca4aca459ffda844faa8b4'
@@ -40,7 +40,7 @@ try:
  out['devices']['cpu']={'name':platform.processor() or platform.machine()}
  if torch.cuda.is_available():
   p=torch.cuda.get_device_properties(0)
-  out['devices']['rocm' if torch.version.hip else 'cuda']={'name':p.name,'memoryBytes':p.total_memory,'driver':str(torch.version.hip or torch.version.cuda),'uuid':str(getattr(p,'uuid',''))}
+  out['devices']['rocm' if torch.version.hip else 'cuda']={'name':p.name,'memoryBytes':p.total_memory,'driver':str(torch.version.hip or torch.version.cuda),'uuid':str(getattr(p,'uuid','')),'architecture':str(getattr(p,'gcnArchName','')).split(':')[0]}
  if hasattr(torch.backends,'mps') and torch.backends.mps.is_available(): out['devices']['mps']={'name':'Apple GPU'}
  if hasattr(torch,'xpu') and torch.xpu.is_available(): out['devices']['xpu']={'name':torch.xpu.get_device_name(0)}
 except Exception: out['error']='RUNTIME_MISSING_OR_INCOMPATIBLE'
@@ -65,6 +65,8 @@ try:
  if platform.system() == 'Linux' and platform.machine() == 'aarch64' and any(x in compatible for x in ('rk3588','rk3566','rk3568')):
   out['devices']['rknn']={'name':'Rockchip NPU', 'runtime':out['versions']['rknn-toolkit-lite2']}
 except Exception: pass
+from singverse_compute.core.audio_runtime import audio_runtime_profile
+out['audioRuntimeProfile']=audio_runtime_profile()
 print(json.dumps(out))'''
 
 
@@ -115,7 +117,8 @@ class AudioModels:
             saved = self.root / 'settings.json'
             if saved.is_file():
                 data = json.loads(saved.read_text())
-                self.selection = data.get('selection', 'auto')
+                saved_selection = data.get('selection', 'auto')
+                self.selection = 'auto' if saved_selection == 'cpu' else saved_selection
                 self.qualified = data.get('qualified', {})
             record = self.root / 'operation.json'
             if record.is_file():
@@ -150,6 +153,26 @@ class AudioModels:
                                                  memory_limit=self.audio.settings.audio_memory_bytes))
                 except Exception:
                     environment = {'devices': {}, 'versions': {}, 'error': 'RUNTIME_MISSING_OR_INCOMPATIBLE'}
+                # One public ROCm image preserves both general AMD wheels and the
+                # isolated gfx1103 runtime. Qualification and inference must use
+                # the same interpreter; importing either stays outside the API.
+                native_python = os.environ.get('COMPUTE_AUDIO_ROCM_GFX1103_PYTHON')
+                rocm = environment.get('devices', {}).get('rocm', {})
+                if native_python and (not rocm or rocm.get('architecture') == 'gfx1103'):
+                    if rocm:
+                        environment['devices'].pop('rocm')
+                    try:
+                        native = json.loads(run([native_python, '-c', PROBE], timeout=30, limit=65536,
+                                                memory_limit=self.audio.settings.audio_memory_bytes))
+                        device = native.get('devices', {}).get('rocm', {})
+                        if device.get('architecture') == 'gfx1103' and native.get('audioRuntimeProfile') == 'rocm-native':
+                            environment['devices']['rocm'] = device
+                            environment['versions'].update(native['versions'])
+                            environment['rocmPython'] = native_python
+                            environment['audioRuntimeProfile'] = native['audioRuntimeProfile']
+                            environment.pop('error', None)
+                    except Exception:
+                        pass
                 if getattr(self.audio.settings, 'audio_cpu_python', None):
                     cpu = self.audio.cpu_runtime(refresh)
                     environment['independentCpu'] = cpu
@@ -252,11 +275,10 @@ class AudioModels:
     def selected(self, entries=None):
         entries = self.entries() if entries is None else entries
         available = {item['id'] for item in entries if item['state'] == 'AVAILABLE'}
-        hardware = any(item.get('detected') for item in entries)
         selection = self.selection
         fallback = getattr(self.audio.transcoding.backends, 'cpu_fallback', True)
-        choices = ('cuda', 'rocm', 'openvino', 'rknn', 'mps') if selection == 'auto' else (selection,)
-        if selection != 'cpu' and (not hardware or fallback):
+        choices = ('cuda', 'rocm', 'openvino', 'rknn', 'mps') if selection in ('auto', 'cpu') else (selection,)
+        if fallback:
             choices += ('cpu',)
         return next((item for item in choices if item in available), None)
 
@@ -346,12 +368,12 @@ class AudioModels:
     def deployment(self):
         variant = build_info()['variant']
         profiles = []
-        for backend in ('cpu', 'cuda', 'rocm', 'openvino'):
-            suffix = {'cuda': ' -f infra/docker/compose/compose.nvidia.yaml', 'rocm': ' -f infra/docker/compose/compose.rocm.yaml', 'rocm-native': ' -f infra/docker/compose/compose.rocm.yaml', 'openvino': ' -f infra/docker/compose/compose.dri.yaml'}.get(backend, '')
+        for backend in ('cuda', 'rocm', 'openvino', 'rknn'):
+            suffix = ' -f infra/docker/compose/compose.' + {'cuda': 'nvidia', 'rocm': 'rocm', 'openvino': 'dri', 'rknn': 'rknn'}[backend] + '.yaml'
             profiles.append({'backend': backend, 'image': f'singverse-compute:<版本>-{backend}',
                              'command': f'COMPUTE_RUNTIME={backend} docker compose --project-directory . -f infra/docker/compose/compose.compute.yaml{suffix} up -d --no-build',
                              'included': includes_backend(backend), 'requiresRedeploy': variant not in ('native', backend)})
-        return {'profiles': profiles, 'note': '在实际节点执行部署；镜像架构由Docker选择，GPU后端需显式配置。宿主驱动不由网页安装。'}
+        return {'profiles': profiles, 'note': '按硬件选择四种加速镜像；均内置 CPU 降级环境，不提供独立 CPU 镜像。宿主驱动需在实际节点配置。'}
 
     def weights_valid(self):
         try:
@@ -365,6 +387,8 @@ class AudioModels:
             return False
 
     def choose(self, backend):
+        if backend == 'cpu':
+            raise ComputeError(422, 'CPU 仅用于加速失败后的自动降级，请选择 auto 或加速设备')
         if backend not in ('auto', *BACKENDS):
             raise ComputeError(400, 'Unknown audio inference backend')
         if backend != 'auto' and not any(b['id'] == backend and b['state'] == 'AVAILABLE' for b in self.entries()):
@@ -662,7 +686,7 @@ class AudioModels:
                 elif native:
                     free = int(native.request(self.audio.native_key(backend), {'op': 'resources'}, timeout=30)['freeMemoryBytes'])
                 else:
-                    free = int(run([sys.executable, '-c', 'import torch; print(torch.cuda.mem_get_info()[0])'], timeout=30, limit=4096,
+                    free = int(run([AudioRoles.inference_python(self.audio, backend), '-c', 'import torch; print(torch.cuda.mem_get_info()[0])'], timeout=30, limit=4096,
                                    memory_limit=self.audio.settings.audio_memory_bytes))
             except Exception as error:
                 raise ComputeError(422, 'GPU free memory cannot be determined') from error

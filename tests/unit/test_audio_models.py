@@ -179,18 +179,58 @@ class AudioModelManagementTest(unittest.TestCase):
         self.assertIn('所需算子',caught.exception.message)
         self.assertNotIn('/private',caught.exception.message)
 
-    def test_explicit_cpu_is_allowed_even_when_accelerator_is_detected(self):
+    def test_cpu_is_only_automatic_fallback_and_always_respects_policy(self):
         manager = self.manager
         with patch.object(manager, 'entries', return_value=[{'id':'cpu','state':'AVAILABLE','detected':False}, {'id':'cuda','state':'UNVERIFIED','detected':True}]):
             self.assertEqual(manager.selected(), 'cpu')
-            manager.choose('cpu')
-            self.assertEqual(manager.selected(), 'cpu')
+            with self.assertRaisesRegex(ComputeError, 'CPU'):
+                manager.choose('cpu')
             manager.audio.transcoding.backends.cpu_fallback = False
-            self.assertEqual(manager.selected(), 'cpu')
-            manager.selection = 'auto'
             self.assertIsNone(manager.selected())
         with patch.object(manager, 'entries', return_value=[{'id':'cpu','state':'AVAILABLE','detected':False}]):
+            self.assertIsNone(manager.selected(), 'No GPU must not bypass a disabled fallback policy')
+            manager.audio.transcoding.backends.cpu_fallback = True
             self.assertEqual(manager.selected(), 'cpu')
+
+    def test_deployment_offers_four_accelerators_including_rknn(self):
+        with patch('singverse_compute.application.audio_models.build_info', return_value={'variant': 'rknn'}), \
+             patch('singverse_compute.core.build_info.build_info', return_value={'variant': 'rknn'}):
+            profiles = self.manager.deployment()['profiles']
+        self.assertEqual({item['backend'] for item in profiles}, {'cuda', 'rocm', 'openvino', 'rknn'})
+        rknn = next(item for item in profiles if item['backend'] == 'rknn')
+        self.assertTrue(rknn['included'])
+        self.assertFalse(rknn['requiresRedeploy'])
+        self.assertIn('compose.rknn.yaml', rknn['command'])
+
+    def test_single_rocm_image_selects_native_gfx1103_for_probe_and_inference(self):
+        manager = self.manager
+        main = {'devices': {'rocm': {'name': 'AMD 780M', 'architecture': 'gfx1103'}}, 'versions': {'torch': 'legacy'}}
+        native = {'devices': {'rocm': {'name': 'AMD 780M', 'architecture': 'gfx1103'}},
+                  'versions': {'torch': 'native'}, 'audioRuntimeProfile': 'rocm-native'}
+        python = '/opt/gfx1103/bin/python'
+        with patch.dict('os.environ', {'COMPUTE_AUDIO_ROCM_GFX1103_PYTHON': python}), \
+             patch('singverse_compute.infrastructure.transcoding.process.run', side_effect=[json.dumps(main).encode(), json.dumps(native).encode()]) as run:
+            environment = manager.probe(refresh=True)
+        self.assertEqual(run.call_args_list[1].args[0][0], python)
+        self.assertEqual(environment['rocmPython'], python)
+        self.assertEqual(environment['versions']['torch'], 'native')
+        manager.audio.models = manager
+        self.assertEqual(AudioRoles.inference_python(manager.audio, 'rocm'), python)
+        self.assertNotEqual(AudioRoles.inference_python(manager.audio, 'cpu'), python)
+        self.assertNotEqual(AudioRoles.inference_python(manager.audio, 'cuda'), python)
+
+    def test_general_rocm_does_not_load_gfx1103_runtime_and_native_failure_keeps_cpu(self):
+        manager = self.manager
+        for architecture, calls in [('gfx1030', 1), ('gfx1103', 2)]:
+            main = {'devices': {'rocm': {'name': 'AMD GPU', 'architecture': architecture}, 'cpu': {'name': 'CPU'}}, 'versions': {}}
+            with self.subTest(architecture=architecture), \
+                 patch.dict('os.environ', {'COMPUTE_AUDIO_ROCM_GFX1103_PYTHON': '/native/bin/python'}), \
+                 patch('singverse_compute.infrastructure.transcoding.process.run', side_effect=[json.dumps(main).encode(), ComputeError(422, 'Native runtime failed')]) as run:
+                environment = manager.probe(refresh=True)
+            self.assertEqual(run.call_count, calls)
+            self.assertIn('cpu', environment['devices'])
+            self.assertEqual('rocm' in environment['devices'], architecture != 'gfx1103')
+            self.assertNotIn('rocmPython', environment)
 
 
     def test_installed_rknn_manifest_miss_and_hit_do_not_wait_for_environment_probe(self):

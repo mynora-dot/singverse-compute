@@ -1,7 +1,7 @@
 SHELL := /bin/sh
 .DEFAULT_GOAL := help
 PYTHON ?= python3
-COMPUTE_RUNTIME ?= base
+COMPUTE_RUNTIME ?= cuda
 COMPOSE = docker compose --project-directory . -f infra/docker/compose/compose.compute.yaml
 .PHONY: help compute-setup compute-check compute-run docker-build docker-up docker-down docker-status docker-test docker-context-check
 

@@ -1,5 +1,5 @@
 ARG PYTHON_IMAGE=python:3.12-slim-bookworm@sha256:e697c81897302a4c4333bade000d98038fbb21eb064f8ee1fd42d02ebcd9d337
-FROM ${PYTHON_IMAGE} AS base
+FROM ${PYTHON_IMAGE} AS common
 ARG TARGETARCH
 # Official Jellyfin release assets, pinned by version AND SHA-256.
 RUN --mount=type=cache,id=singverse-compute-apt,target=/var/cache/apt,sharing=locked \
@@ -33,36 +33,38 @@ ENV COMPUTE_AUTH_TOKEN_FILE=/run/singverse-compute/token \
     COMPUTE_FFMPEG=/usr/lib/jellyfin-ffmpeg/ffmpeg COMPUTE_FFPROBE=/usr/lib/jellyfin-ffmpeg/ffprobe
 ARG SINGVERSE_VERSION=0.0.0
 ARG SOURCE_REVISION=local
-RUN python -c "import json,os,hashlib,pathlib; p=pathlib.Path('singverse_compute/core/build.json'); p.write_text(json.dumps(dict(version=os.environ['SINGVERSE_VERSION'],revision=os.environ['SOURCE_REVISION'],variant='base',runtimeLock=hashlib.sha256(b''.join(f.read_bytes() for f in sorted(pathlib.Path('.').glob('requirements*.lock')))).hexdigest(),sourceDigest=hashlib.sha256(b''.join(str(f).encode()+f.read_bytes() for f in sorted(pathlib.Path('singverse_compute').rglob('*.py')))).hexdigest())))"
+RUN python -c "import json,os,hashlib,pathlib; p=pathlib.Path('singverse_compute/core/build.json'); p.write_text(json.dumps(dict(version=os.environ['SINGVERSE_VERSION'],revision=os.environ['SOURCE_REVISION'],variant='internal',runtimeLock=hashlib.sha256(b''.join(f.read_bytes() for f in sorted(pathlib.Path('.').glob('requirements*.lock')))).hexdigest(),sourceDigest=hashlib.sha256(b''.join(str(f).encode()+f.read_bytes() for f in sorted(pathlib.Path('singverse_compute').rglob('*.py')))).hexdigest())))"
 # Generated metadata comes after COPY normalization; normalize it and every lock
 # explicitly even when the builder/extractor uses umask 077.
 RUN chmod 644 /opt/singverse-compute/requirements*.lock /opt/singverse-compute/singverse_compute/core/build.json
-ENV SINGVERSE_COMPUTE_VARIANT=base
 LABEL org.opencontainers.image.title="SingVerse Compute" \
       org.singverse.image.version-source="release-tag" \
       org.opencontainers.image.version="${SINGVERSE_VERSION}" \
       org.opencontainers.image.revision="${SOURCE_REVISION}"
 USER 10001:10001
-RUN python -c "from pathlib import Path; from singverse_compute.core.build_info import build_info; assert build_info()['variant'] == 'base'; [p.read_bytes() for p in Path('.').glob('requirements*.lock')]"
+RUN python -c "from pathlib import Path; [p.read_bytes() for p in Path('.').glob('requirements*.lock')]"
 HEALTHCHECK --interval=5s --timeout=3s --start-period=20s --retries=6 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health',timeout=2)"
 CMD ["python", "-m", "singverse_compute", "--host", "0.0.0.0", "--port", "8090"]
 
-# Advanced Demucs has its own driver-independent CPU worker in every legacy variant.
-FROM base AS legacy-base
+# Every accelerator image includes the same driver-independent CPU fallback.
+FROM common AS cpu-fallback
 USER root
 RUN --mount=type=cache,target=/root/.cache/pip /opt/singverse-audio-cpu/bin/python -m pip install -r requirements-audio.lock && \
     /opt/singverse-audio-cpu/bin/python -m pip check
 USER 10001:10001
 
-# Runtime variants contain no model weights. Download/import is an administrator operation.
-FROM legacy-base AS cpu
+# AMD gfx1103 uses an isolated pinned runtime alongside the general ROCm wheels.
+# This is an internal dependency stage, not a separately published image.
+FROM common AS rocm-gfx1103-deps
 USER root
-RUN --mount=type=cache,target=/root/.cache/pip python -m pip install -r requirements-audio.lock
-ENV SINGVERSE_COMPUTE_VARIANT=cpu
-USER 10001:10001
+RUN --mount=type=cache,target=/root/.cache/pip python -m venv /opt/singverse-audio-rocm-gfx1103 && \
+    /opt/singverse-audio-rocm-gfx1103/bin/python -m pip install -r requirements.lock && \
+    /opt/singverse-audio-rocm-gfx1103/bin/python -m pip install --no-build-isolation -r requirements-audio-rocm-native.lock && \
+    /opt/singverse-audio-rocm-gfx1103/bin/python -m pip check
 
-FROM legacy-base AS cuda
+# Runtime variants contain no model weights. Download/import is an administrator operation.
+FROM cpu-fallback AS cuda
 USER root
 ARG TARGETARCH
 RUN test "$TARGETARCH" = amd64
@@ -73,15 +75,18 @@ ENV COMPUTE_AUDIO_ACCELERATOR_PYTHON=/opt/singverse-audio-accelerator/bin/python
 ENV SINGVERSE_COMPUTE_VARIANT=cuda NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 USER 10001:10001
 
-FROM legacy-base AS rocm
+FROM cpu-fallback AS rocm
 USER root
 ARG TARGETARCH
 RUN test "$TARGETARCH" = amd64
 RUN --mount=type=cache,target=/root/.cache/pip python -m pip install -r requirements-audio-rocm.lock
-ENV SINGVERSE_COMPUTE_VARIANT=rocm
+COPY --from=rocm-gfx1103-deps /opt/singverse-audio-rocm-gfx1103 /opt/singverse-audio-rocm-gfx1103
+ENV SINGVERSE_COMPUTE_VARIANT=rocm \
+    COMPUTE_AUDIO_ROCM_GFX1103_PYTHON=/opt/singverse-audio-rocm-gfx1103/bin/python \
+    HOME=/tmp USER=singverse LOGNAME=singverse
 USER 10001:10001
 
-FROM legacy-base AS openvino
+FROM cpu-fallback AS openvino
 USER root
 ARG TARGETARCH
 RUN test "$TARGETARCH" = amd64
@@ -91,27 +96,10 @@ RUN --mount=type=cache,target=/root/.cache/pip python -m pip install -r requirem
 ENV SINGVERSE_COMPUTE_VARIANT=openvino
 USER 10001:10001
 
-# gfx1103 requires native device libraries absent from the legacy ROCm 6.2 wheels.
-# Keep this explicit profile separate from CPU/CUDA/legacy ROCm dependencies.
-FROM legacy-base AS rocm-native
-USER root
-ARG TARGETARCH
-RUN test "$TARGETARCH" = amd64
-RUN --mount=type=cache,target=/root/.cache/pip python -m pip install --no-build-isolation -r requirements-audio-rocm-native.lock && python -m pip check
-ENV SINGVERSE_COMPUTE_VARIANT=rocm-native HOME=/tmp USER=singverse LOGNAME=singverse
-USER 10001:10001
-
-# UVR baseline keeps the same pinned CPU DSP dependencies.
-FROM cpu AS uvr
-ENV SINGVERSE_COMPUTE_VARIANT=uvr
-USER root
-RUN --mount=type=cache,target=/root/.cache/pip python -m pip install -r requirements-audio-uvr.lock
-USER 10001:10001
-
-FROM uvr AS rknn
+FROM cpu-fallback AS rknn
 USER root
 ARG TARGETARCH
 RUN test "$TARGETARCH" = arm64
-RUN --mount=type=cache,target=/root/.cache/pip python -m pip install -r requirements-audio-rknn.lock
+RUN --mount=type=cache,target=/root/.cache/pip python -m pip install -r requirements-audio-uvr.lock -r requirements-audio-rknn.lock
 ENV SINGVERSE_COMPUTE_VARIANT=rknn
 USER 10001:10001

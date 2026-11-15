@@ -111,7 +111,9 @@ class SeparationEngine:
         available = {item['id'] for item in self.entries(only_cpu=requested in ('cpu', 'openvino-cpu')) if item['state'] == 'AVAILABLE'}
         if require_cpu and 'cpu' not in available:
             return None
-        choices = (requested,) if requested and requested != 'auto' else ('tensorrt', 'cuda', 'migraphx', 'openvino', 'mlx', 'coreml', 'directml', 'rknn', 'cpu')
+        choices = (requested,) if requested and requested != 'auto' else ('tensorrt', 'cuda', 'migraphx', 'openvino', 'mlx', 'coreml', 'directml', 'rknn')
+        if requested in (None, '', 'auto') and self.audio.transcoding.backends.cpu_fallback:
+            choices += ('cpu',)
         return next((item for item in choices if item in available), None)
 
     def status(self, refresh=False):
@@ -142,6 +144,8 @@ class SeparationEngine:
     def admit(self, profile, backend=None, source_audio_id=None):
         if source_audio_id is not None or profile == DSP:
             return 'cpu'
+        if backend in ('cpu', 'openvino-cpu'):
+            raise ComputeError(422, 'CPU 仅用于加速失败后的自动降级，请选择 auto 或加速设备')
         selected = self.selected(backend)
         if selected is None and backend not in (None, '', 'auto', 'cpu') and self.audio.transcoding.backends.cpu_fallback:
             selected = self.selected('cpu')

@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -50,7 +51,7 @@ class ReleaseTests(unittest.TestCase):
 
     def test_existing_equal_tag_is_retryable_and_different_tag_is_never_written(self):
         for existing in ('sha256:equal', 'sha256:different'):
-            with patch.object(release, 'remote_digest', return_value=existing), patch.object(release, 'run') as publish:
+            with patch.object(release, 'remote_digest', return_value=existing), patch.object(release, 'copy_image') as publish:
                 if existing.endswith('different'):
                     with self.assertRaises(ValueError):
                         release.ensure('registry/image:1.0.0', 'sha256:equal', publish)
@@ -59,7 +60,7 @@ class ReleaseTests(unittest.TestCase):
                 publish.assert_not_called()
 
     def test_absent_tag_is_verified_after_copy(self):
-        with patch.object(release, 'remote_digest', side_effect=[None, 'sha256:expected']), patch.object(release, 'run') as copy:
+        with patch.object(release, 'remote_digest', side_effect=[None, 'sha256:expected']), patch.object(release, 'copy_image') as copy:
             release.ensure('registry/image:1.0.0', 'sha256:expected', copy)
             copy.assert_called_once()
 
@@ -76,8 +77,9 @@ class ReleaseTests(unittest.TestCase):
             calls.append(ref)
             if ref.startswith('registry.example.com/'):
                 raise RuntimeError('destination unavailable')
-        with patch.dict(release.os.environ, self.env(), clear=True), patch.object(release, 'VARIANTS', {'base': ['amd64']}), \
-             patch.object(release.subprocess, 'check_output', return_value=raw), patch.object(release, 'ensure', side_effect=ensure):
+        with patch.dict(release.os.environ, self.env(), clear=True), patch.object(release, 'VARIANTS', {'cuda': ['amd64']}), \
+             patch.object(release.subprocess, 'check_output', return_value=raw), patch.object(release, 'layout'), \
+             patch.object(release, 'ensure', side_effect=ensure):
             with self.assertRaises(RuntimeError):
                 release.publish(Path('/unused'))
         self.assertFalse(any(':latest' in ref for ref in calls))
@@ -89,25 +91,24 @@ class ReleaseTests(unittest.TestCase):
             events.append(('fixed', ref, digest))
             publish()
         def copy(*args):
-            if args[-1].endswith(':latest-base'):
+            if args[-1].endswith(':latest-cuda'):
                 events.append(('latest', args[-1]))
-        with patch.dict(release.os.environ, self.env(), clear=True), patch.object(release, 'VARIANTS', {'base': ['amd64']}), \
+        with patch.dict(release.os.environ, self.env(), clear=True), patch.object(release, 'VARIANTS', {'cuda': ['amd64']}), \
              patch.object(release.subprocess, 'check_output', return_value=raw), patch.object(release, 'ensure', side_effect=ensure), \
-             patch.object(release, 'layout'), patch.object(release, 'run', side_effect=copy):
+             patch.object(release, 'layout'), patch.object(release, 'copy_image', side_effect=copy):
             release.publish(Path('/unused'))
-        self.assertEqual([event[0] for event in events], ['fixed'] * 6 + ['latest'] * 3)
-        self.assertEqual(len({event[2] for event in events[3:6]}), 1)
+        self.assertEqual([event[0] for event in events], ['fixed'] * 3 + ['latest'] * 3)
+        self.assertEqual(len({event[2] for event in events[:3]}), 1)
         self.assertTrue(all(event[1].startswith('docker://') for event in events[-3:]))
         self.assertEqual(len({event[1] for event in events[-3:]}), 3)
 
     def test_version_index_failure_does_not_update_latest(self):
         raw = json.dumps({'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.manifest.v1+json'}).encode()
         def ensure(ref, digest, publish):
-            if not ref.endswith('-amd64'):
-                raise RuntimeError('index publication failed')
-        with patch.dict(release.os.environ, self.env(), clear=True), patch.object(release, 'VARIANTS', {'base': ['amd64']}), \
+            raise RuntimeError('index publication failed')
+        with patch.dict(release.os.environ, self.env(), clear=True), patch.object(release, 'VARIANTS', {'cuda': ['amd64']}), \
              patch.object(release.subprocess, 'check_output', return_value=raw), patch.object(release, 'ensure', side_effect=ensure), \
-             patch.object(release, 'layout'), patch.object(release, 'run') as copy:
+             patch.object(release, 'layout'), patch.object(release, 'copy_image') as copy:
             with self.assertRaises(RuntimeError):
                 release.publish(Path('/unused'))
             copy.assert_not_called()
@@ -140,16 +141,16 @@ class ReleaseTests(unittest.TestCase):
             events.append(('latest', args[-1]))
 
         with patch.dict(release.os.environ, self.env(), clear=True), \
-             patch.object(release, 'VARIANTS', {'base': ['amd64', 'arm64'], 'cuda': ['amd64']}), \
+             patch.object(release, 'VARIANTS', {'cuda': ['amd64', 'arm64'], 'rocm': ['amd64']}), \
              patch.object(release.subprocess, 'run', side_effect=restore), \
              patch.object(release.subprocess, 'check_output', return_value=raw), \
              patch.object(release, 'ensure', side_effect=lambda ref, digest, publish: events.append(('fixed', ref))), \
-             patch.object(release, 'layout', side_effect=layout), patch.object(release, 'run', side_effect=copy):
+             patch.object(release, 'layout', side_effect=layout), patch.object(release, 'copy_image', side_effect=copy):
             release.publish(Path('/unused'), from_release=True)
 
-        self.assertEqual(restored, ['base-amd64', 'base-arm64', 'cuda-amd64'])
+        self.assertEqual(restored, ['cuda-amd64', 'cuda-arm64', 'rocm-amd64'])
         self.assertEqual(len(roots), 2)
-        self.assertEqual([event[0] for event in events], ['fixed'] * 15 + ['latest'] * 6)
+        self.assertEqual([event[0] for event in events], ['fixed'] * 6 + ['latest'] * 6)
         self.assertTrue(all(not root.exists() for root in roots))
 
     def test_missing_release_archive_stops_publishing_and_cleans_downloads(self):
@@ -192,17 +193,54 @@ class ReleaseTests(unittest.TestCase):
 
         def ensure(ref, digest, publish):
             fixed.append(ref)
-            if ref.endswith('-cuda'):
+            if ref.endswith('-rocm'):
                 raise RuntimeError('later runtime failed')
 
         with patch.dict(release.os.environ, self.env(), clear=True), \
-             patch.object(release, 'VARIANTS', {'base': ['amd64'], 'cuda': ['amd64']}), \
+             patch.object(release, 'VARIANTS', {'cuda': ['amd64'], 'rocm': ['amd64']}), \
              patch.object(release.subprocess, 'check_output', return_value=raw), \
              patch.object(release, 'ensure', side_effect=ensure), patch.object(release, 'layout'), \
-             patch.object(release, 'run') as copy:
+             patch.object(release, 'copy_image') as copy:
             with self.assertRaisesRegex(RuntimeError, 'later runtime failed'):
                 release.publish(Path('/unused'))
-        self.assertTrue(any(ref.endswith('-base') for ref in fixed))
+        self.assertTrue(any(ref.endswith('-cuda') for ref in fixed))
+        copy.assert_not_called()
+
+    def test_stalled_copy_is_killed_and_reports_its_destination(self):
+        original_popen = subprocess.Popen
+        processes = []
+
+        def spawn(command):
+            process = original_popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+            processes.append(process)
+            return process
+
+        with patch.object(release.subprocess, 'Popen', side_effect=spawn), \
+             patch.object(release, 'COPY_TIMEOUT_SECONDS', 0.02), \
+             patch.object(release, 'PROGRESS_INTERVAL_SECONDS', 0.5), patch('builtins.print') as log:
+            with self.assertRaisesRegex(RuntimeError, 'timed out.*registry/image:1.0.0'):
+                release.copy_image('oci:/checked:release', 'docker://registry/image:1.0.0')
+        self.assertIsNotNone(processes[0].poll())
+        self.assertTrue(any('Still copying registry/image:1.0.0' in str(call) for call in log.call_args_list))
+        self.assertFalse(any('Copied registry/image' in str(call) for call in log.call_args_list))
+
+    def test_failed_copy_does_not_report_success(self):
+        original_popen = subprocess.Popen
+
+        def spawn(command):
+            return original_popen([sys.executable, '-c', 'raise SystemExit(7)'])
+
+        with patch.object(release.subprocess, 'Popen', side_effect=spawn), patch('builtins.print') as log:
+            with self.assertRaises(subprocess.CalledProcessError) as caught:
+                release.copy_image('oci:/checked:release', 'docker://registry/image:1.0.0')
+        self.assertEqual(caught.exception.returncode, 7)
+        self.assertFalse(any('Copied registry/image' in str(call) for call in log.call_args_list))
+
+    def test_remote_inspection_timeout_never_creates_a_tag(self):
+        with patch.object(release.subprocess, 'run', side_effect=subprocess.TimeoutExpired(['skopeo'], 120)), \
+             patch.object(release, 'copy_image') as copy:
+            with self.assertRaisesRegex(RuntimeError, 'Registry inspection timed out.*registry/image:1.0.0'):
+                release.ensure('registry/image:1.0.0', 'sha256:expected', copy)
         copy.assert_not_called()
 
     def test_oci_layout_preserves_blob_bytes_and_deterministic_index(self):
@@ -211,19 +249,76 @@ class ReleaseTests(unittest.TestCase):
         digest = hashlib.sha256(data).hexdigest()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            source = root / 'base-amd64'
+            source = root / 'cuda-amd64'
             source.mkdir()
             with tarfile.open(source / 'image.tar', 'w') as archive:
                 member = tarfile.TarInfo('blobs/sha256/' + digest)
                 member.size = len(data)
                 archive.addfile(member, io.BytesIO(data))
-            with patch.object(release, 'VARIANTS', {'base': ['amd64']}):
-                release.layout(root, 'base', raw, root / 'layout')
+            release.layout(root, 'cuda', raw, root / 'layout')
             self.assertEqual((root / 'layout/blobs/sha256' / digest).read_bytes(), data)
             index = json.loads((root / 'layout/index.json').read_text())
             descriptor = index['manifests'][0]
             self.assertEqual(descriptor['digest'], 'sha256:' + hashlib.sha256(raw).hexdigest())
             self.assertEqual((root / 'layout/blobs/sha256' / descriptor['digest'].split(':')[1]).read_bytes(), raw)
+
+    def test_four_runtime_release_has_only_eight_tags_per_registry_and_is_retryable(self):
+        registries, copies, raw_manifests = {}, [], {}
+
+        def copy(source, destination):
+            if source.startswith('oci:'):
+                folder = Path(source[4:].removesuffix(':release'))
+                root = json.loads((folder/'index.json').read_bytes())['manifests'][0]
+                raw = (folder/'blobs/sha256'/root['digest'].split(':')[1]).read_bytes()
+                # The full graph is present even though no architecture tag exists.
+                for entry in json.loads(raw)['manifests']:
+                    data = (folder/'blobs/sha256'/entry['digest'].split(':')[1]).read_bytes()
+                    self.assertEqual('sha256:'+hashlib.sha256(data).hexdigest(), entry['digest'])
+            else:
+                raw = registries[source.removeprefix('docker://')]
+            registries[destination.removeprefix('docker://')] = raw
+            copies.append(destination)
+
+        def inspect(command, **kwargs):
+            return raw_manifests[Path(command[-1].removeprefix('oci-archive:')).parent.name]
+
+        def digest(reference):
+            raw = registries.get(reference)
+            return 'sha256:'+hashlib.sha256(raw).hexdigest() if raw else None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            for variant, arches in release.VARIANTS.items():
+                for arch in arches:
+                    name = f'{variant}-{arch}'
+                    folder = directory/name
+                    folder.mkdir()
+                    raw = json.dumps(dict(schemaVersion=2, mediaType='application/vnd.oci.image.manifest.v1+json',
+                                          annotations={'fixture': name})).encode()
+                    raw_manifests[name] = raw
+                    with tarfile.open(folder/'image.tar', 'w') as archive:
+                        member = tarfile.TarInfo('blobs/sha256/'+hashlib.sha256(raw).hexdigest())
+                        member.size = len(raw)
+                        archive.addfile(member, io.BytesIO(raw))
+            with patch.dict(release.os.environ, self.env(), clear=True), \
+                 patch.object(release.subprocess, 'check_output', side_effect=inspect), \
+                 patch.object(release, 'remote_digest', side_effect=digest), \
+                 patch.object(release, 'copy_image', side_effect=copy):
+                release.publish(directory)
+                self.assertEqual(len(copies), 24)
+                self.assertTrue(all(':latest-' not in ref for ref in copies[:12]))
+                self.assertTrue(all(':latest-' in ref for ref in copies[12:]))
+                expected = {f'{version}-{runtime}' for version in ('1.2.3', 'latest')
+                            for runtime in ('cuda', 'rocm', 'openvino', 'rknn')}
+                for prefix in release.config(self.env())[1]:
+                    tags = {ref.split(':')[-1] for ref in registries if ref.startswith(prefix+'/')}
+                    self.assertEqual(tags, expected)
+                    for runtime, arch in [('cuda', 'amd64'), ('rocm', 'amd64'), ('openvino', 'amd64'), ('rknn', 'arm64')]:
+                        fixed = registries[f'{prefix}/singverse-compute:1.2.3-{runtime}']
+                        self.assertEqual(fixed, registries[f'{prefix}/singverse-compute:latest-{runtime}'])
+                        self.assertEqual(json.loads(fixed)['manifests'][0]['platform'], {'os': 'linux', 'architecture': arch})
+                release.publish(directory)
+                self.assertEqual(len(copies), 36, 'Retries reuse all immutable tags and only refresh latest')
 
 
 if __name__ == '__main__':

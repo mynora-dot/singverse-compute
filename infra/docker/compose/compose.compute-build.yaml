@@ -1,10 +1,10 @@
 services:
   singverse-compute:
-    image: 'singverse-compute:local-${COMPUTE_RUNTIME:-base}'
+    image: 'singverse-compute:local-${COMPUTE_RUNTIME:-cuda}'
     build:
       context: .
       dockerfile: infra/docker/build/compute.Dockerfile
-      target: '${COMPUTE_RUNTIME:-base}'
+      target: '${COMPUTE_RUNTIME:-cuda}'
       args:
         SINGVERSE_VERSION: '${SINGVERSE_VERSION:-0.0.0}'
         SOURCE_REVISION: '${SINGVERSE_SOURCE_REVISION:-local}'

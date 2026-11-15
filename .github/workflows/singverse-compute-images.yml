@@ -41,6 +41,24 @@ jobs:
           ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
           ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
         run: python3 infra/docker/release.py validate
+  macos:
+    if: needs.preflight.outputs.publish == 'true'
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_REVISION: ${{ needs.preflight.outputs.revision }}
+      SINGVERSE_VERSION: ${{ needs.preflight.outputs.version }}
+      RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.revision }}
+      - name: Package the native Apple Silicon installer and publish immutable assets
+        run: python3 scripts/package-macos.py --publish
   build:
     needs: preflight
     permissions:
@@ -53,7 +71,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: [{"variant": "base", "arch": "amd64", "runner": "ubuntu-24.04"}, {"variant": "base", "arch": "arm64", "runner": "ubuntu-24.04-arm"}, {"variant": "cpu", "arch": "amd64", "runner": "ubuntu-24.04"}, {"variant": "cpu", "arch": "arm64", "runner": "ubuntu-24.04-arm"}, {"variant": "uvr", "arch": "amd64", "runner": "ubuntu-24.04"}, {"variant": "uvr", "arch": "arm64", "runner": "ubuntu-24.04-arm"}, {"variant": "cuda", "arch": "amd64", "runner": "ubuntu-24.04"}, {"variant": "rocm", "arch": "amd64", "runner": "ubuntu-24.04"}, {"variant": "rocm-native", "arch": "amd64", "runner": "ubuntu-24.04"}, {"variant": "openvino", "arch": "amd64", "runner": "ubuntu-24.04"}, {"variant": "rknn", "arch": "arm64", "runner": "ubuntu-24.04-arm"}]
+        include:
+          - {variant: cuda, arch: amd64, runner: ubuntu-24.04}
+          - {variant: rocm, arch: amd64, runner: ubuntu-24.04}
+          - {variant: openvino, arch: amd64, runner: ubuntu-24.04}
+          - {variant: rknn, arch: arm64, runner: ubuntu-24.04-arm}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
@@ -121,4 +143,4 @@ jobs:
           printf '%s' "$DOCKERHUB_TOKEN" | skopeo login docker.io --username "$DOCKERHUB_USERNAME" --password-stdin
           printf '%s' "$ACR_PASSWORD" | skopeo login "$ACR_REGISTRY" --username "$ACR_USERNAME" --password-stdin
       - name: Publish identical immutable artifacts, then update latest
-        run: python3 infra/docker/release.py publish --from-release
+        run: python3 -u infra/docker/release.py publish --from-release

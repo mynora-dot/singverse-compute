@@ -44,7 +44,7 @@ flowchart TD
 
 加速器初始化、驱动、算子、显存／worker 内存、崩溃或超时故障，清理未完成输出，从同一解码 PCM、同一 MDX 配方在 CPU 重试一次；原后端熔断 10 分钟。选定设备已失去资格时，可按开启的 `cpuFallback` 策略直接选择合格 CPU，记录原因。源文件、回源认证、磁盘错误、取消不触发计算重试。CPU 再失败就结束任务。**干净档不会自动改为 DSP。**
 
-高级档的 CPU worker 可用同一独立 CPU 环境追加 CPU 专用 Demucs。所有 legacy 容器变体都安装此路径；原生节点使用下方 `--legacy`。CPU 环境没有 Demucs 时，高级档 CPU 不授予资格，MDX 与 DSP 仍可运行。旧 RKNN 入口是 MDX，不能失败后换成 HTDemucs；要获得同模型 CPU 回退，应使用 `AI_CLEAN`。
+高级档的 CPU worker 可用同一独立 CPU 环境追加 CPU 专用 Demucs。四种加速镜像均安装此降级路径；原生节点使用下方 `--legacy`，Mac Release 安装器自动完成此步骤。CPU 环境没有 Demucs 时，高级档 CPU 不授予资格，MDX 与 DSP 仍可运行。旧 RKNN 入口是 MDX，不能失败后换成 HTDemucs；要获得同模型 CPU 回退，应使用 `AI_CLEAN`。
 
 ## 安装与首次使用
 
@@ -65,13 +65,13 @@ make compute-separation-cpu-setup
 export COMPUTE_AUDIO_CPU_PYTHON="$PWD/.venv-audio-cpu/bin/python"
 export COMPUTE_AUDIO_MODEL_REPO="$PWD/.tools/demucs-htdemucs"
 export COMPUTE_AUDIO_THREADS=0
-# 如有独立 GPU/Metal 环境，再设置此项；CPU 节点可不设置。
+# 如有独立 GPU/Metal 环境，再设置此项；CPU 降级使用上方的独立解释器。
 # export COMPUTE_AUDIO_ACCELERATOR_PYTHON=/absolute/path/to/.venv-audio-accelerator/bin/python
 ```
 
 `COMPUTE_AUDIO_MODEL_REPO` 沿用原 HTDemucs 路径约定，MDX 位于其同级 `uvr-mdxnet-9482/UVR_MDXNET_9482.onnx`，并不要求同时安装 HTDemucs。还需按 compute README 配置凭据、缓存、FFmpeg 与 Go 连接。模型不在处理任务中隐式下载。重启后，后台自动检查已安装 MDX 的 CPU；加速设备在“性能节点配置”选择对应 MDX 试跑，不由安装包名称直接授予资格。
 
-默认 base 容器含最小 CPU ORT，不声明 GPU 设备；高级 cpu/cuda/rocm/openvino/rknn 变体另含独立 CPU Torch。容器内运行中的加速 worker 故障可以回退；若 NVIDIA Container Toolkit 在**容器创建前**因宿主驱动失败，应用尚未启动，需使用不声明 GPU 的 CPU 部署入口，不能宣称 Python 可以自动修复容器启动失败。没有部署两套业务服务或在容器内挂载 Docker socket。
+Docker 只发布 cuda、rocm、openvino、rknn 四种加速镜像，均内置独立 CPU ORT / Torch 降级环境；Mac 使用同一 Release 的原生安装包。CPU 只在允许自动降级时使用，不作为独立部署或用户可选 AI 后端。加速 worker 不可用或执行失败时，使用已通过试跑的 CPU 运行同一模型。容器创建前的宿主驱动或设备映射错误需先修复部署，Python 尚未启动时不能执行降级；不部署第二套业务服务，不挂载 Docker socket。
 
 本地管理员 CLI 复用生产实现，可在不启动 HTTP 的情况下验证授权自备素材：
 
