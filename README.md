@@ -101,10 +101,11 @@ cd .
 
 “系统设置 → 性能节点配置”支持 AUTO/MANUAL/DISABLED。Go 仓库的组合 `infra/docker/compose/compose.yaml` 通过已知服务名和共享凭据自动识别，无需填写。独立节点可由 Go 通过受限候选私网地址进行 HTTP 单播发现和配对，不依赖 Docker bridge 难以转发的广播或 mDNS。`GET /internal/v1/status` 使用 Bearer 认证返回身份、API 版本和实际能力；健康页可用不代表认证或媒体能力可用。
 
-独立部署示例（在目标设备的仓库根执行，媒体原件只读）：
+独立预构建镜像部署示例（在目标设备的仓库根执行，先在 `.env` 选择已发布的 `IMAGE_PREFIX`、`COMPUTE_VERSION` 与 `COMPUTE_RUNTIME`）：
 
 ```sh
-docker compose --project-directory . -f infra/docker/compose/compose.compute.yaml up -d --build
+docker compose --project-directory . -f infra/docker/compose/compose.compute.yaml pull
+docker compose --project-directory . -f infra/docker/compose/compose.compute.yaml up -d --no-build --wait
 ```
 
 默认仅发布 `127.0.0.1:18090`。跨主机部署时显式设置 `COMPUTE_HTTP_BIND` 为该设备受限内网地址，限制入站访问；公网使用可信 TLS 反向代理，保留认证与证书验证。主应用 Compose 的计算端口保持不公开。`infra/docker/compose/compose.compute.yaml` 使用独立项目与凭据卷，不启动业务数据库。
@@ -273,7 +274,7 @@ SINGVERSE_TEST_GO_ROOT="/path/to/go-backend" SINGVERSE_TEST_SEPARATION_APP_BINAR
 
 ## 分设备计算镜像（CPU／CUDA／ROCm／OpenVINO）
 
-镜像按推理后端划分，不按处理器型号命名。统一 Go 和 compute 发行版本：
+镜像按推理后端划分，不按处理器型号命名。compute 使用独立的 `COMPUTE_VERSION`，不要求与 Go 版本一致：
 
 | 标签后缀 | 架构 | 环境 | 设备验收状态 |
 |---|---|---|---|
@@ -317,7 +318,7 @@ ROCm 6.2 的现有轮子缺少这台 gfx1103 所需的原生算子库，不能�
 
 Dockerfile 和 OpenCL 安装资源统一位于 `infra/docker/build/`。`make compute-images COMPUTE_RUNTIME=cpu` 构建单个运行库；独立节点源码路线使用 compute 基础配置加 compute-build 覆盖，镜像路线只用基础配置，详见[计算节点部署](infra/docker/GPU.md)。
 
-GHCR、Docker Hub 和阿里云统一通过 `.github/workflows/singverse-compute-images.yml` 发布；命名空间、凭据和不可变标签规则见[镜像发布](infra/docker/README.md)。不再提供业务或计算源码 ZIP、离线镜像 ZIP，模型本身的离线导入能力仍保留。
+GHCR、Docker Hub 和阿里云统一通过 `.github/workflows/singverse-compute-images.yml` 发布。Run workflow 可填写 `release_tag` 选择已有正式 Release，并通过 `ghcr_namespace`、`dockerhub_namespace`、`acr_registry`、`acr_namespace` 覆盖本次项目空间；目标参数留空使用仓库 Variables，不填 `release_tag` 只构建检查。部署 `IMAGE_PREFIX` 对应实际仓库域名/命名空间；凭据、镜像地址和不可变标签规则见[镜像发布](infra/docker/README.md)。不再提供业务或计算源码 ZIP、离线镜像 ZIP，模型本身的离线导入能力仍保留。
 
 ### Intel 官方转换模型和离线包
 
