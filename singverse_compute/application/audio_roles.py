@@ -533,10 +533,13 @@ class AudioRoles:
             # before checking resources so the next batch member stays queued.
             if self.active:
                 raise ComputeError(429, 'Audio model worker busy')
+        # Inventory reads validate model files and runtimes. Reuse one admission
+        # snapshot for selection, qualification and fallback, outside scheduler locks.
+        entries = self.models.entries() if not enhanced and mode in ('ANALYZE', 'SEPARATE') and hasattr(self, 'models') else []
         selected = (self.separation.admit(separation_profile, backend, source_audio_id) if enhanced else
-                    None if mode in ('PROBE', 'FAST') else backend or (self.models.selected() if hasattr(self, 'models') else 'cpu'))
+                    None if mode in ('PROBE', 'FAST') else backend or (self.models.selected(entries) if hasattr(self, 'models') else 'cpu'))
         if not enhanced and mode in ('ANALYZE', 'SEPARATE') and hasattr(self, 'models'):
-            available = {item['id'] for item in self.models.entries() if item['state'] == 'AVAILABLE'}
+            available = {item['id'] for item in entries if item['state'] == 'AVAILABLE'}
             if selected not in available and getattr(self.transcoding.backends, 'cpu_fallback', True) and 'cpu' in available:
                 selected = 'cpu'
         if self.stopping or not self.transcoding.available or (not enhanced and mode in ('ANALYZE', 'SEPARATE') and not ((self.backend_runtime_available(selected) if selected else False) if hasattr(self, 'models') else self.available)):
@@ -545,7 +548,7 @@ class AudioRoles:
             raise ComputeError(507, 'Insufficient audio working space')
         # GPU/runtime subprocess queries must not hold the realtime scheduling lock.
         if not enhanced and mode in ('ANALYZE', 'SEPARATE') and hasattr(self, 'models'):
-            if not any(item['id'] == selected and item['state'] == 'AVAILABLE' for item in self.models.entries()):
+            if selected not in available:
                 raise ComputeError(422, 'Selected inference backend has not passed qualification')
             try:
                 self.models.check_resources(selected)
@@ -582,7 +585,7 @@ class AudioRoles:
             if enhanced and specification['separationProfile'] == 'AI_CLEAN' and backend not in (None, '', 'auto', 'cpu') and selected == 'cpu':
                 task.fallback_reason = 'ACCELERATOR_UNAVAILABLE'
                 task.result['fallbackReason'] = task.fallback_reason
-            if not enhanced and backend != 'cpu' and mode in ('ANALYZE', 'SEPARATE') and selected == 'cpu' and hasattr(self, 'models') and any(item.get('detected') for item in self.models.entries()):
+            if not enhanced and backend != 'cpu' and mode in ('ANALYZE', 'SEPARATE') and selected == 'cpu' and any(item.get('detected') for item in entries):
                 task.fallback_reason = 'ACCELERATOR_NOT_READY'
                 task.result['fallbackReason'] = task.fallback_reason
             if mode in ('ANALYZE', 'SEPARATE') and not enhanced:

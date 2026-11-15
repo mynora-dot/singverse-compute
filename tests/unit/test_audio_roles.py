@@ -144,6 +144,30 @@ class AudioRoleWorkerTest(CallbackTestCase):
         self.assertEqual(caught.exception.status, 429)
         self.assertIn('RAM', caught.exception.message)
 
+    def test_cpu_fallback_reuses_qualified_inventory_before_resource_check(self):
+        import threading, uuid
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from singverse_compute.application.audio_roles import AudioRoles
+        from singverse_compute.application.audio_models import AudioModels
+        from singverse_compute.core.errors import ComputeError
+        worker = SimpleNamespace(lock=threading.RLock(), tasks={}, active=False, stopping=False,
+            transcoding=SimpleNamespace(available=True, backends=SimpleNamespace(cpu_fallback=True)),
+            root=Path('/'), settings=SimpleNamespace(minimum_free_bytes=0), backend_runtime_available=lambda _: True)
+        inventory = [{'id': 'mps', 'state': 'FAILED', 'detected': True}, {'id': 'cpu', 'state': 'AVAILABLE'}]
+        manager = SimpleNamespace(audio=worker, selection='auto', entries=Mock(return_value=inventory),
+            check_resources=Mock(side_effect=ComputeError(422, 'Available RAM is below the configured audio process budget')))
+        manager.selected = lambda entries: AudioModels.selected(manager, entries)
+        worker.models = manager
+        for requested in (None, 'mps'):
+            with self.subTest(requested=requested):
+                manager.entries.reset_mock(); manager.check_resources.reset_mock()
+                with self.assertRaises(ComputeError) as caught:
+                    AudioRoles.submit(worker, str(uuid.uuid4()), 'reference', 'SEPARATE', requested, 'http://business')
+                self.assertEqual(caught.exception.status, 429)
+                manager.check_resources.assert_called_once_with('cpu')
+                manager.entries.assert_called_once_with()
+
     def test_real_ffmpeg_derivative_restart_and_readonly_source(self):
         from pathlib import Path
         import hashlib

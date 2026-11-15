@@ -47,12 +47,16 @@ def completed_hls(directory, expected_duration=0):
     if directory.is_symlink():
         raise ComputeError(409, 'Execution artifact directory is invalid')
     artifacts = {}
-    for path in directory.iterdir():
-        if not ARTIFACT.fullmatch(path.name) or path.name == 'output.mp4':
-            continue
-        if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
-            raise ComputeError(409, 'Execution contains invalid artifacts')
-        artifacts[path.name] = path.stat().st_size
+    # A long song can contain thousands of segments. Inspect each file once;
+    # no-follow metadata also rejects links without a second filesystem lookup.
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if not ARTIFACT.fullmatch(entry.name) or entry.name == 'output.mp4':
+                continue
+            info = entry.stat(follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
+                raise ComputeError(409, 'Execution contains invalid artifacts')
+            artifacts[entry.name] = info.st_size
     playlists = [name for name in artifacts if name.endswith('.m3u8')]
     if 'master.m3u8' not in artifacts or len(playlists) < 2 or not any(name.endswith(('.ts', '.m4s')) for name in artifacts):
         raise ComputeError(409, 'Completed HLS artifacts are incomplete')
