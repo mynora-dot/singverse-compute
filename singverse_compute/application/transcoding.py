@@ -59,6 +59,10 @@ class Transcoding:
         self.storage_dirty.set()
         self.usage_bytes = 0
         self.usage_at = 0
+        self.usage_sample_at = 0
+        self.usage_full_at = None
+        self.usage_directories = {}
+        self.storage_changes = set()
         self.closed = threading.Event()
         self.threads = []
         self.realtime_reserved_until = 0
@@ -133,38 +137,76 @@ class Transcoding:
         temp = directory / 'execution.tmp'
         temp.write_text(json.dumps(record), encoding='utf-8')
         temp.replace(directory / 'execution.json')
+        self.storage_changed(task.id)
+
+    def storage_changed(self, identifier):
+        with self.lock:
+            self.storage_changes.add(identifier)
+
+    def directory_usage(self, name):
+        directory = self.root / name
+        try:
+            if not stat.S_ISDIR(directory.stat(follow_symlinks=False).st_mode):
+                return None
+            total = 0
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                        if stat.S_ISREG(info.st_mode):
+                            total += info.st_size
+                    except FileNotFoundError:
+                        pass  # FFmpeg replaces manifests atomically.
+            return total
+        except FileNotFoundError:
+            return None  # Artifact release may finish during accounting.
 
     def usage(self, refresh=False):
-        # Disk scans never hold the scheduling lock. Coalesce concurrent callers and
-        # reuse accounting until files change or an active encoder needs sampling.
+        # Terminal directories are immutable between explicit mutations. Sample
+        # growing directories every five seconds and reconcile the root periodically
+        # so external changes are eventually reflected without rescanning every segment.
         with self.storage_lock:
+            now = time.monotonic()
             with self.lock:
-                active = any(t.state in ('ACCEPTED', 'RUNNING') for t in self.tasks.values())
-            if not refresh and not self.storage_dirty.is_set() and (not active or time.monotonic() - self.usage_at < 5):
+                known = set(self.tasks)
+                active = {t.id for t in self.tasks.values() if t.state in ('ACCEPTED', 'RUNNING')}
+                changed, self.storage_changes = self.storage_changes, set()
+                discover = self.storage_dirty.is_set()
+                self.storage_dirty.clear()
+            full = refresh or self.usage_full_at is None or now - self.usage_full_at >= 300
+            sample = now - self.usage_sample_at >= 5
+            if not full and not changed and not discover and not sample:
                 return self.usage_bytes
-            self.storage_dirty.clear()
-            total = 0
+            sizes = {} if full else dict(self.usage_directories)
+            pending = set(changed)
             try:
-                with os.scandir(self.root) as directories:
-                    for directory in directories:
-                        if not directory.is_dir(follow_symlinks=False):
-                            continue
-                        try:
-                            with os.scandir(directory.path) as entries:
-                                for entry in entries:
-                                    try:
-                                        info = entry.stat(follow_symlinks=False)
-                                        if stat.S_ISREG(info.st_mode):
-                                            total += info.st_size
-                                    except FileNotFoundError:
-                                        pass  # FFmpeg replaces manifests atomically.
-                        except FileNotFoundError:
-                            pass  # Another task may finish artifact release during accounting.
+                if full or discover:
+                    with os.scandir(self.root) as directories:
+                        present = {entry.name for entry in directories if entry.is_dir(follow_symlinks=False)}
+                    for missing in sizes.keys() - present:
+                        del sizes[missing]
+                    pending.update(present if full else (present - sizes.keys()) | (present - known))
+                if sample:
+                    # Non-execution directories include the audio worker's own files.
+                    pending.update(active | (sizes.keys() - known))
+                for name in pending:
+                    size = self.directory_usage(name)
+                    if size is None:
+                        sizes.pop(name, None)
+                    else:
+                        sizes[name] = size
             except OSError:
+                with self.lock:
+                    self.storage_changes.update(changed)
                 self.storage_dirty.set()
                 raise
-            self.usage_bytes, self.usage_at = total, time.monotonic()
-            return total
+            self.usage_directories = sizes
+            self.usage_bytes, self.usage_at = sum(sizes.values()), now
+            if sample or full:
+                self.usage_sample_at = now
+            if full:
+                self.usage_full_at = now
+            return self.usage_bytes
 
     def create(self, identifier, reference, fingerprint, target, callback_origin):
         if not self.available:
@@ -215,7 +257,6 @@ class Transcoding:
             directory.mkdir(exist_ok=False)
             self.tasks[identifier] = task
             self.save(task)
-            self.storage_dirty.set()
             thread = threading.Thread(target=self.execute, args=(task,reference,callback_origin,fingerprint), daemon=True)
             self.threads = [t for t in self.threads if t.is_alive()]
             self.threads.append(thread)
@@ -259,7 +300,8 @@ class Transcoding:
                 for attempt in range(2):
                     task.backend = backend
                     try:
-                        task.mapping = self.encoder.execute(source, network, media, task.target, directory, task.cancel, progress, backend)
+                        result = self.encoder.execute(source, network, media, task.target, directory, task.cancel, progress, backend)
+                        task.mapping = result.mapping
                         break
                     except ComputeError as error:
                         from ..infrastructure.hardware import accelerator_failure
@@ -269,13 +311,15 @@ class Transcoding:
                         task.fallback_reason = 'ACCELERATOR_EXECUTION_FAILED'
                         backend = 'software'
                 if task.target.purpose == 'OFFLINE':
+                    if result.media is None:
+                        raise ComputeError(422, 'Offline output was not validated')
                     output = directory / 'output.mp4'
                     digest = hashlib.sha256()
                     with output.open('rb') as stream:
                         while chunk := stream.read(1048576):
                             digest.update(chunk)
                     task.output = {'sha256':digest.hexdigest(), 'size':output.stat().st_size,
-                                   'media':asdict(self.probe.read(output))}
+                                   'media':asdict(result.media)}
                 outcome = 'CANCELLED' if task.cancel.is_set() else 'SUCCEEDED'
                 if outcome == 'SUCCEEDED' and task.target.purpose == 'REALTIME':
                     completed_hls(directory, max(0, media.duration - task.target.start))
@@ -288,12 +332,14 @@ class Transcoding:
             with self.lock:
                 task.state = 'CANCELLED' if outcome == 'SUCCEEDED' and task.cancel.is_set() else outcome
                 task.finished = time.time()
-                self.storage_dirty.set()
-                self.save(task)
-                if task.state in ('FAILED','CANCELLED'):
-                    for artifact in directory.iterdir():
-                        if artifact.name != 'execution.json' and artifact.is_file() and not artifact.is_symlink():
-                            artifact.unlink()
+                try:
+                    self.save(task)
+                    if task.state in ('FAILED','CANCELLED'):
+                        for artifact in directory.iterdir():
+                            if artifact.name != 'execution.json' and artifact.is_file() and not artifact.is_symlink():
+                                artifact.unlink()
+                finally:
+                    self.storage_changed(task.id)
 
     def get(self, identifier):
         task = self.tasks.get(identifier)
@@ -343,14 +389,16 @@ class Transcoding:
 
     def delete_directory(self, identifier):
         directory = self.root / identifier
-        if directory.is_symlink():
-            directory.unlink()
-        else:
-            try:
-                shutil.rmtree(directory)
-            except FileNotFoundError:
-                pass
-        self.storage_dirty.set()
+        try:
+            if directory.is_symlink():
+                directory.unlink()
+            else:
+                try:
+                    shutil.rmtree(directory)
+                except FileNotFoundError:
+                    pass
+        finally:
+            self.storage_changed(identifier)
 
     def remove(self, identifier):
         with self.lock:
@@ -457,7 +505,7 @@ class Transcoding:
                 self.save(task)
                 return task.view()
         finally:
-            self.storage_dirty.set()
+            self.storage_changed(identifier)
             with self.lock:
                 task.deleting = False
 

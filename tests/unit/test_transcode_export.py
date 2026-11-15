@@ -15,7 +15,7 @@ import uuid
 from singverse_compute.application.transcoding import Execution, Transcoding
 from singverse_compute.core.config import Settings
 from singverse_compute.core.errors import ComputeError
-from singverse_compute.domain.transcoding import Media, Stream, Target
+from singverse_compute.domain.transcoding import EncodingResult, Media, Stream, Target
 from singverse_compute.infrastructure.security import InternalAuth
 
 
@@ -44,7 +44,8 @@ class TranscodeExportTest(CallbackTestCase):
                 (directory / 'stream_0.m3u8').write_text(f'#EXTM3U\n#EXT-X-MAP:URI="init_0.mp4"\n#EXTINF:{60-target.start},\nstream_0_000000.m4s\n#EXT-X-ENDLIST\n')
                 (directory / 'init_0.mp4').write_bytes(b'initialization')
                 (directory / 'stream_0_000000.m4s').write_bytes(b'complete media data')
-            return [{'sourceId': 'stream:0', 'kind': 'video', 'outputIndex': 0}]
+            return EncodingResult([{'sourceId': 'stream:0', 'kind': 'video', 'outputIndex': 0}],
+                                  media if target.purpose == 'OFFLINE' else None)
 
         self.ports = (auth, probe,
                       SimpleNamespace(execute=encode), SimpleNamespace(select=lambda *a, **kw: 'software'), remote_input)
@@ -285,6 +286,143 @@ class TranscodeExportTest(CallbackTestCase):
         with patch('singverse_compute.application.transcoding.os.scandir', side_effect=AssertionError('Historical cache rescanned')):
             self.assertEqual(self.service.usage(), first)
             self.service.collect()
+
+    def test_active_storage_sample_reuses_unchanged_terminal_directory_sizes(self):
+        completed, active = self.create(), self.create()
+        before = self.service.usage()
+        self.service.get(active).state = 'RUNNING'
+        artifact = self.service.root / active / 'stream_0_000000.m4s'
+        artifact.write_bytes(artifact.read_bytes() + b'growth')
+        with patch('singverse_compute.application.transcoding.time.monotonic', return_value=self.service.usage_at + 6), \
+                patch.object(self.service, 'directory_usage', wraps=self.service.directory_usage) as scanned:
+            self.assertEqual(self.service.usage(), before + len(b'growth'))
+        self.assertEqual([call.args[0] for call in scanned.call_args_list], [active])
+        self.assertNotEqual(active, completed)
+
+    def test_frequent_other_directory_changes_do_not_postpone_active_or_audio_sampling(self):
+        completed, active = self.create(), self.create()
+        audio = self.service.root / 'audio-roles'
+        audio.mkdir()
+        output = audio / 'output.m4a'
+        output.write_bytes(b'audio')
+        self.service.storage_dirty.set()
+        before = self.service.usage(refresh=True)
+        sampled = self.service.usage_sample_at
+        self.service.get(active).state = 'RUNNING'
+        artifact = self.service.root / active / 'stream_0_000000.m4s'
+        artifact.write_bytes(artifact.read_bytes() + b'growth')
+        output.write_bytes(b'audio growth')
+        for second in range(1, 6):
+            with patch('singverse_compute.application.transcoding.time.monotonic', return_value=sampled + second):
+                self.service.save(self.service.get(completed))
+                current = self.service.usage()
+                self.assertEqual(current, before if second < 5 else before + len(b'growth') + len(b' growth'))
+        self.assertEqual(self.service.usage_sample_at, sampled + 5)
+
+    def test_full_reconciliation_detects_external_terminal_changes_and_keeps_checking_disk_free(self):
+        identifier = self.create()
+        before = self.service.usage()
+        artifact = self.service.root / identifier / 'external.mp4'
+        artifact.write_bytes(b'external modification')
+        with patch('singverse_compute.application.transcoding.time.monotonic', return_value=self.service.usage_at + 6):
+            self.assertEqual(self.service.usage(), before)
+        with patch('singverse_compute.application.transcoding.time.monotonic', return_value=self.service.usage_full_at + 301):
+            self.assertEqual(self.service.usage(), before + artifact.stat().st_size)
+        self.service.get(identifier).state = 'RUNNING'
+        with patch('singverse_compute.application.transcoding.shutil.disk_usage', return_value=SimpleNamespace(free=-1)) as disk:
+            self.service.collect()
+        disk.assert_called_once_with(self.service.root)
+        self.assertTrue(self.service.get(identifier).cancel.is_set())
+        self.assertEqual(self.service.get(identifier).error, 'STORAGE_BUDGET_EXHAUSTED')
+
+    def test_acknowledge_and_partial_delete_failure_invalidate_only_the_changed_directory(self):
+        identifier, retained = self.create(Target(purpose='OFFLINE')), self.create()
+        self.service.usage()
+        with patch.object(self.service, 'directory_usage', wraps=self.service.directory_usage) as scanned:
+            self.service.acknowledge(identifier)
+            self.service.usage()
+        self.assertEqual([call.args[0] for call in scanned.call_args_list], [identifier])
+        self.assertEqual(self.service.usage_directories[identifier], (self.service.root / identifier / 'execution.json').stat().st_size)
+        task = self.service.get(retained)
+        task.renewed = task.finished = time.time() - 601
+        def partial_delete(directory):
+            (directory / 'stream_0_000000.m4s').unlink()
+            raise OSError('fixture partial deletion')
+        with patch('singverse_compute.application.transcoding.shutil.rmtree', side_effect=partial_delete):
+            with self.assertRaises(OSError):
+                self.service.collect()
+        self.assertIn(retained, self.service.tasks)
+        expected = sum(file.stat().st_size for file in (self.service.root / retained).iterdir())
+        self.service.usage()
+        self.assertEqual(self.service.usage_directories[retained], expected)
+        self.service.collect()
+        self.assertNotIn(retained, self.service.tasks)
+        self.assertNotIn(retained, self.service.usage_directories)
+
+    def test_failed_encoding_invalidates_sampled_partial_artifacts_after_cleanup(self):
+        identifier = str(uuid.uuid4())
+        def fail(source, network, media, target, directory, cancel, progress, backend):
+            (directory / 'partial.mp4').write_bytes(b'partial output')
+            self.service.usage()
+            raise ComputeError(422, 'fixture encoder failure')
+        with patch.object(self.service.encoder, 'execute', side_effect=fail):
+            self.create_transcode(self.service, identifier, self.source, 'failed-song', Target())
+            for thread in self.service.threads:
+                thread.join(2)
+        self.assertEqual(self.service.get(identifier).state, 'FAILED')
+        self.service.usage()
+        self.assertEqual(self.service.usage_directories[identifier], (self.service.root / identifier / 'execution.json').stat().st_size)
+
+    def test_mutation_during_an_inflight_scan_is_accounted_by_the_next_call(self):
+        import threading
+        identifier = self.create()
+        before = self.service.usage()
+        entered, proceed = threading.Event(), threading.Event()
+        scan = self.service.directory_usage
+        def blocked(name):
+            size = scan(name)
+            entered.set()
+            self.assertTrue(proceed.wait(3))
+            return size
+        with patch.object(self.service, 'directory_usage', side_effect=blocked):
+            worker = threading.Thread(target=lambda: self.service.usage(refresh=True))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                (self.service.root / identifier / 'additional.mp4').write_bytes(b'added during scan')
+                self.service.storage_changed(identifier)
+            finally:
+                proceed.set()
+                worker.join(3)
+        self.assertEqual(self.service.usage_bytes, before)
+        self.assertEqual(self.service.usage(), before + len(b'added during scan'))
+
+    def test_shared_audio_directory_is_discovered_sampled_and_invalidated_on_release(self):
+        self.create()
+        before = self.service.usage()
+        audio = self.service.root / 'audio-roles'
+        audio.mkdir()
+        output = audio / 'output.m4a'
+        output.write_bytes(b'audio output')
+        self.service.storage_dirty.set()
+        self.assertEqual(self.service.usage(), before + len(b'audio output'))
+        output.write_bytes(b'growing audio output')
+        with patch('singverse_compute.application.transcoding.time.monotonic', return_value=self.service.usage_at + 6):
+            self.assertEqual(self.service.usage(), before + len(b'growing audio output'))
+        output.unlink()
+        self.service.storage_dirty.set()
+        self.assertEqual(self.service.usage(), before)
+
+    def test_offline_output_reuses_the_encoder_validated_media_without_a_second_probe(self):
+        from dataclasses import asdict
+        from unittest.mock import Mock
+        media = self.service.probe.read('fixture')
+        self.service.probe.read = Mock(side_effect=[media])
+        identifier = self.create(Target(purpose='OFFLINE'))
+        self.assertEqual(self.service.probe.read.call_count, 1, 'Only the input needs application-level probing')
+        self.assertEqual(self.service.get(identifier).output['media'], asdict(media))
+        output = self.service.root / identifier / 'output.mp4'
+        self.assertEqual(self.service.get(identifier).output['sha256'], hashlib.sha256(output.read_bytes()).hexdigest())
 
     def test_slow_storage_scan_does_not_block_playback_lease(self):
         import threading

@@ -4,6 +4,7 @@ from .process import run
 from .probe import FORMATS
 from .pipelines import PipelineSelector, software_filters, dimensions
 from ...core.errors import ComputeError
+from ...domain.transcoding import EncodingResult
 
 HLS_SEGMENT_SECONDS = 2
 
@@ -136,6 +137,7 @@ class Encoder:
             if failures and not blocked and not non_accelerator_failure(error.message) and not cancel.is_set():
                 raise ComputeError(422, 'Hardware accelerator execution failed') from error
             raise
+        result = None
         if target.purpose == 'OFFLINE':
             output = directory / 'output.partial.mp4'
             result = self.probe.read(output)
@@ -148,5 +150,5 @@ class Encoder:
             if result.duration <= 0 or media.duration > 0 and abs(result.duration - (media.duration-target.start)) > 2:
                 raise ComputeError(422, 'Incomplete output')
             output.rename(directory / 'output.mp4')
-        return [{'sourceId':s.id, 'outputIndex':i, 'kind':s.kind, 'language':s.language, 'title':s.title,
-                 'channels':s.channels} for i,s in enumerate(([video] if video else []) + audios)]
+        return EncodingResult([{'sourceId':s.id, 'outputIndex':i, 'kind':s.kind, 'language':s.language, 'title':s.title,
+                                'channels':s.channels} for i,s in enumerate(([video] if video else []) + audios)], result)

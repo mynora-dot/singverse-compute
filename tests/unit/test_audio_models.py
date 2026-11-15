@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from singverse_compute.application.audio_models import AudioModels, DIGEST, NAME, CONFIG
 from singverse_compute.application.audio_roles import AudioRoles
@@ -266,6 +266,10 @@ class StartupQualificationTest(unittest.TestCase):
         manager = self.manager
         manager.audio.lock = threading.RLock()
         manager.audio.active = False
+        manager.audio.slot = threading.BoundedSemaphore(1)
+        manager.audio.tasks = {}
+        manager.audio.backend_runtime_available = lambda backend: True
+        manager.audio._separate = Mock()
         manager.audio.transcoding.lock = threading.RLock()
         manager.audio.transcoding.realtime_reserved_until = 0
         manager.audio.transcoding.tasks = {}
@@ -277,11 +281,12 @@ class StartupQualificationTest(unittest.TestCase):
         entries = [{'id': 'cpu', 'state': 'UNVERIFIED'}, {'id': 'mps', 'state': 'UNVERIFIED', 'detected': True},
                    {'id': 'cuda', 'state': 'MODEL_MISSING'}, {'id': 'openvino', 'state': 'AVAILABLE'}]
         calls = []
-        def test(backend):
+        def test(backend, **kwargs):
             calls.append(backend)
             manager.thread = threading.Thread(target=lambda: None)
             manager.thread.start()
-        with patch.object(manager, 'probe'), patch.object(manager, 'entries', return_value=entries), patch.object(manager, 'test', side_effect=test):
+            return manager.thread, manager.operation
+        with patch.object(manager, 'probe'), patch.object(manager, 'entries', return_value=entries), patch.object(manager, '_test', side_effect=test):
             manager.start(); manager.start(); manager.startup_thread.join(2)
         self.assertEqual(calls, ['mps', 'cpu'])
         self.assertEqual(manager.startup_check['state'], 'COMPLETED')
@@ -290,16 +295,42 @@ class StartupQualificationTest(unittest.TestCase):
         manager = self.prepare_startup()
         manager.audio.transcoding.backends.cpu_fallback = False
         entries = [{'id': 'cpu', 'state': 'UNVERIFIED'}, {'id': 'mps', 'state': 'AVAILABLE', 'detected': True}]
-        with patch.object(manager, 'probe'), patch.object(manager, 'entries', return_value=entries), patch.object(manager, 'test') as trial:
+        with patch.object(manager, 'probe'), patch.object(manager, 'entries', return_value=entries), patch.object(manager, '_test') as trial:
             manager.start(); manager.startup_thread.join(2)
         trial.assert_not_called()
         self.assertEqual(manager.startup_check['state'], 'COMPLETED')
+
+    def test_startup_waits_only_for_its_own_trial_when_another_operation_starts(self):
+        import threading
+        manager = self.prepare_startup()
+        proceed = threading.Event()
+        unrelated = threading.Thread(target=lambda: proceed.wait(3))
+        def test(backend, **kwargs):
+            finished = threading.Thread(target=lambda: None)
+            finished.start()
+            finished.join()
+            # A manual operation replaces the shared handles after this trial ends.
+            manager.thread = unrelated
+            manager.operation = {'state': 'DOWNLOADING'}
+            unrelated.start()
+            return finished, {'state': 'SUCCEEDED'}
+        with patch.object(manager, 'probe'), \
+                patch.object(manager, 'entries', return_value=[{'id': 'cpu', 'state': 'UNVERIFIED'}]), \
+                patch.object(manager, '_test', side_effect=test):
+            manager.start()
+            try:
+                manager.startup_thread.join(1)
+                self.assertEqual(manager.startup_check['state'], 'COMPLETED')
+                self.assertTrue(unrelated.is_alive())
+            finally:
+                proceed.set()
+                manager.close()
 
     def test_startup_waits_for_playback_and_can_be_cancelled_without_running_inference(self):
         import time
         manager = self.prepare_startup()
         manager.audio.transcoding.realtime_reserved_until = time.monotonic() + 60
-        with patch.object(manager, 'probe'), patch.object(manager, 'entries', return_value=[{'id': 'cpu', 'state': 'UNVERIFIED'}]), patch.object(manager, 'test') as trial:
+        with patch.object(manager, 'probe'), patch.object(manager, 'entries', return_value=[{'id': 'cpu', 'state': 'UNVERIFIED'}]), patch.object(manager, '_test') as trial:
             manager.start()
             deadline = time.monotonic() + 2
             while manager.startup_check['state'] != 'WAITING' and time.monotonic() < deadline:
@@ -308,3 +339,128 @@ class StartupQualificationTest(unittest.TestCase):
             manager.close()
         trial.assert_not_called()
         self.assertEqual(manager.startup_check['state'], 'CANCELLED')
+
+    def test_startup_slow_prepare_does_not_lock_playback_and_rechecks_its_reservation(self):
+        import threading
+        manager = self.prepare_startup()
+        entered, proceed = threading.Event(), threading.Event()
+        calls = []
+        def probe(*args, **kwargs):
+            calls.append(True)
+            if len(calls) == 2:
+                entered.set()
+                self.assertTrue(proceed.wait(3))
+            return b'{"devices":{"cpu":{"name":"fixture"}},"versions":{}}'
+        with patch('singverse_compute.infrastructure.transcoding.process.run', side_effect=probe), \
+                patch.object(manager, 'entries', return_value=[{'id': 'cpu', 'state': 'UNVERIFIED'}]):
+            manager.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                acquired = manager.audio.transcoding.lock.acquire(blocking=False)
+                self.assertTrue(acquired, 'Cold probe must release the playback scheduling lock')
+                if acquired:
+                    try:
+                        manager.audio.transcoding.tasks['playback'] = SimpleNamespace(state='RUNNING')
+                    finally:
+                        manager.audio.transcoding.lock.release()
+                with self.assertRaises(ComputeError) as caught:
+                    manager.begin('IMPORTING')
+                self.assertEqual(caught.exception.status, 409, 'Slow preparation must reserve the model operation')
+                proceed.set()
+                # Wait for the qualification worker to reject the newly admitted playback.
+                for _ in range(200):
+                    if manager.operation['state'] == 'FAILED':
+                        break
+                    threading.Event().wait(.01)
+                self.assertEqual(manager.operation['error'], 'Realtime playback has priority')
+                self.assertNotIn('cpu', manager.qualified)
+                manager.audio._separate.assert_not_called()
+                self.assertFalse(manager.audio.active)
+            finally:
+                proceed.set()
+                manager.close()
+        self.assertEqual(manager.startup_check['state'], 'CANCELLED')
+
+    def test_cancel_during_cold_probe_returns_without_waiting_and_never_starts_inference(self):
+        import threading
+        manager = self.prepare_startup()
+        entered, proceed, stopped = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+        def probe(*args, **kwargs):
+            entered.set()
+            self.assertTrue(proceed.wait(3))
+            return b'{"devices":{"cpu":{"name":"fixture"}},"versions":{}}'
+        def qualify():
+            try:
+                manager.test('cpu')
+            except ComputeError as error:
+                errors.append(error)
+        with patch('singverse_compute.infrastructure.transcoding.process.run', side_effect=probe):
+            worker = threading.Thread(target=qualify)
+            stopper = None
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                stopper = threading.Thread(target=lambda: (manager.stop(), stopped.set()))
+                stopper.start()
+                self.assertTrue(stopped.wait(1), 'Cancellation must not wait behind the runtime probe')
+            finally:
+                proceed.set()
+                worker.join(3)
+                if stopper:
+                    stopper.join(3)
+        self.assertEqual([error.status for error in errors], [409])
+        self.assertEqual(manager.operation['state'], 'CANCELLED')
+        self.assertIsNone(manager.thread)
+        manager.audio._separate.assert_not_called()
+        self.assertTrue(manager.audio.slot.acquire(blocking=False))
+
+    def test_playback_preempts_resource_check_and_releases_the_audio_slot(self):
+        import threading
+        manager = self.prepare_startup()
+        entered, proceed = threading.Event(), threading.Event()
+        def resources(backend):
+            entered.set()
+            self.assertTrue(proceed.wait(3))
+        with patch.object(manager, 'probe', return_value=manager.environment), \
+                patch.object(manager, 'check_resources', side_effect=resources):
+            manager.test('cpu')
+            try:
+                self.assertTrue(entered.wait(1))
+                manager.audio.native_worker = None
+                AudioRoles.preempt(manager.audio)
+            finally:
+                proceed.set()
+                manager.thread.join(3)
+        self.assertEqual(manager.operation['state'], 'CANCELLED')
+        self.assertNotIn('cpu', manager.qualified)
+        self.assertFalse(manager.audio.active)
+        self.assertFalse(manager.audio.tasks)
+        self.assertTrue(manager.audio.slot.acquire(blocking=False))
+        manager.audio._separate.assert_not_called()
+
+    def test_cancel_during_final_model_digest_does_not_publish_a_qualification(self):
+        import threading
+        manager = self.prepare_startup()
+        entered, proceed = threading.Event(), threading.Event()
+        calls = []
+        def digest(model):
+            calls.append(model)
+            if len(calls) == 2:
+                entered.set()
+                self.assertTrue(proceed.wait(3))
+            return DIGEST
+        manager.audio._separate = lambda source, output, task: (source, source)
+        with patch.object(manager, 'probe', return_value=manager.environment), \
+                patch.object(manager, 'check_resources'), patch.object(manager, 'inference_digest', side_effect=digest), \
+                patch('singverse_compute.application.audio_models._rms', return_value=.1):
+            manager.test('cpu')
+            try:
+                self.assertTrue(entered.wait(2))
+                manager.stop()
+            finally:
+                proceed.set()
+                manager.thread.join(3)
+        self.assertEqual(manager.operation['state'], 'CANCELLED')
+        self.assertNotIn('cpu', manager.qualified)
+        self.assertFalse(manager.audio.active)

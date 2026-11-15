@@ -15,7 +15,7 @@ from singverse_compute.application.transcode_artifacts import ready_hls
 from singverse_compute.application.transcoding import Transcoding
 from singverse_compute.application.audio_models import AudioModels
 from singverse_compute.core.config import Settings
-from singverse_compute.domain.transcoding import Media, Stream, Target
+from singverse_compute.domain.transcoding import EncodingResult, Media, Stream, Target
 from singverse_compute.infrastructure.security import InternalAuth
 from singverse_compute.infrastructure.transcoding.backends import Backends
 from singverse_compute.infrastructure.transcoding.encoder import Encoder
@@ -109,7 +109,7 @@ class PlaybackStartupTest(CallbackTestCase):
                 (directory / 'master.m3u8').write_text('#EXTM3U\nstream_0.m3u8\n')
                 (directory / 'stream_0.m3u8').write_text('#EXTM3U\n#EXTINF:60,\nstream_0_000000.ts\n#EXT-X-ENDLIST\n')
                 (directory / 'stream_0_000000.ts').write_bytes(b'complete media')
-                return []
+                return EncodingResult([])
             settings = Settings(token_file=root / 'token', transcode_root=root / 'cache', minimum_free_bytes=0,
                                 ffmpeg=sys.executable, ffprobe=sys.executable)
             service = Transcoding(settings, auth, probe, SimpleNamespace(execute=encode),
@@ -167,9 +167,10 @@ class PlaybackStartupTest(CallbackTestCase):
                     if purpose == 'OFFLINE': (directory / 'output.partial.mp4').write_bytes(b'complete fixture')
                     return b''
                 with patch('singverse_compute.infrastructure.transcoding.encoder.run', side_effect=execute) as run:
-                    encoder.execute('fixture', False, media, Target(mode=mode,purpose=purpose,profile='baseline',level=31),
-                                    directory, __import__('threading').Event(), lambda *args:None, 'software')
+                    result = encoder.execute('fixture', False, media, Target(mode=mode,purpose=purpose,profile='baseline',level=31),
+                                             directory, __import__('threading').Event(), lambda *args:None, 'software')
                     command = run.call_args.args[0]
+                self.assertIs(result.media, media if purpose == 'OFFLINE' else None)
                 if mode == 'TRANSCODE':
                     self.assertEqual(command[command.index('-profile:v')+1], 'baseline')
                     self.assertEqual(command[command.index('-level:v')+1], '3.1')
@@ -184,3 +185,25 @@ class PlaybackStartupTest(CallbackTestCase):
                     self.assertEqual(command[command.index('-hls_time')+1], '4' if mode == 'REMUX' else '2')
                 else:
                     self.assertNotIn('-hls_time', command)
+
+    def test_offline_encoder_rejects_incomplete_media_before_publishing_its_result(self):
+        from singverse_compute.core.errors import ComputeError
+        from singverse_compute.infrastructure.transcoding.pipelines import VideoPipeline
+        source = Media('mp4', 60, 1000, (Stream('stream:0', 0, 'video', 'h264'),))
+        incomplete = replace(source, duration=10)
+        backend = SimpleNamespace(features=lambda: {}, prefix=lambda name: [], upload=lambda name: '')
+        probe = SimpleNamespace(read=Mock(return_value=incomplete))
+        encoder = Encoder('ffmpeg', probe, backend)
+        encoder.pipelines.choose = Mock(return_value=VideoPipeline('fixture'))
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            def execute(*args, **kwargs):
+                (directory / 'output.partial.mp4').write_bytes(b'incomplete fixture')
+            with patch('singverse_compute.infrastructure.transcoding.encoder.run', side_effect=execute), \
+                    self.assertRaises(ComputeError) as caught:
+                encoder.execute('fixture', False, source, Target(mode='REMUX', purpose='OFFLINE'), directory,
+                                __import__('threading').Event(), lambda *args: None, 'software')
+            self.assertEqual(caught.exception.message, 'Incomplete output')
+            self.assertFalse((directory / 'output.mp4').exists())
+            self.assertTrue((directory / 'output.partial.mp4').exists())
+        probe.read.assert_called_once()

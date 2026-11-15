@@ -87,7 +87,7 @@ class ExecutionPolicyTest(CallbackTestCase):
 
     def test_video_retry_only_before_playlist_and_when_enabled(self):
         from singverse_compute.application.transcoding import Transcoding, Execution
-        from singverse_compute.domain.transcoding import Media, Stream, Target
+        from singverse_compute.domain.transcoding import EncodingResult, Media, Stream, Target
         from singverse_compute.core.config import Settings
         from singverse_compute.infrastructure.security import InternalAuth
         for enabled, published, message, expected in [(True, False, 'Hardware accelerator execution failed', 2),
@@ -109,7 +109,7 @@ class ExecutionPolicyTest(CallbackTestCase):
                     (directory/'master.m3u8').write_text('#EXTM3U\nstream_0.m3u8\n')
                     (directory/'stream_0.m3u8').write_text('#EXTM3U\n#EXTINF:60,\nstream_0_000000.ts\n#EXT-X-ENDLIST\n')
                     (directory/'stream_0_000000.ts').write_bytes(b'complete fixture')
-                    return []
+                    return EncodingResult([])
                 service = Transcoding(config, auth, probe, SimpleNamespace(execute=encode), backends, remote_input)
                 task = Execution('task', 'signature', Target()); task.cpu_fallback = enabled
                 (cache/'task').mkdir()

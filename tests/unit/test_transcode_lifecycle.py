@@ -11,7 +11,7 @@ import time
 from singverse_compute.application.transcoding import Transcoding
 from singverse_compute.core.config import Settings
 from singverse_compute.core.errors import ComputeError
-from singverse_compute.domain.transcoding import Target,Media,Stream
+from singverse_compute.domain.transcoding import EncodingResult, Target,Media,Stream
 from singverse_compute.infrastructure.security import InternalAuth
 
 class LifecycleTest(CallbackTestCase):
@@ -28,7 +28,7 @@ class LifecycleTest(CallbackTestCase):
                 def execute(self,source,network,media,target,directory,cancel,progress,backend):
                     entered.set();cancel.wait(10)
                     if cancel.is_set():raise ComputeError(409,'Cancelled')
-                    return []
+                    return EncodingResult([])
             config=Settings(token_file=root/'token',transcode_root=root/'cache',minimum_free_bytes=0)
             service=Transcoding(config,auth,Probe(),Encoder(),Backends(),remote_input)
             try:

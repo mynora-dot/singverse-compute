@@ -100,6 +100,7 @@ class AudioModels:
         self.root = audio.root / 'models' if audio.root else None
         self.lock = threading.RLock()
         self.manifest_lock = threading.RLock()
+        self.probe_lock = threading.Lock()
         self.cancel = threading.Event()
         self.thread = None
         self.startup_thread = None
@@ -136,22 +137,25 @@ class AudioModels:
                     temporary.replace(self.root / (name + '.json'))
 
     def probe(self, refresh=False):
-        with self.lock:
-            if self.environment is None or refresh:
+        if self.environment is not None and not refresh:
+            return self.environment
+        with self.probe_lock:
+            environment = self.environment
+            if environment is None or refresh:
                 from ..infrastructure.hardware import accelerators
                 accelerators.cache_clear()
                 from ..infrastructure.transcoding.process import run
                 try:
-                    self.environment = json.loads(run([sys.executable, '-c', PROBE], timeout=30, limit=65536,
-                                                      memory_limit=self.audio.settings.audio_memory_bytes))
+                    environment = json.loads(run([sys.executable, '-c', PROBE], timeout=30, limit=65536,
+                                                 memory_limit=self.audio.settings.audio_memory_bytes))
                 except Exception:
-                    self.environment = {'devices': {}, 'versions': {}, 'error': 'RUNTIME_MISSING_OR_INCOMPATIBLE'}
+                    environment = {'devices': {}, 'versions': {}, 'error': 'RUNTIME_MISSING_OR_INCOMPATIBLE'}
                 if getattr(self.audio.settings, 'audio_cpu_python', None):
                     cpu = self.audio.cpu_runtime(refresh)
-                    self.environment['independentCpu'] = cpu
-                    self.environment['devices'].pop('cpu', None)
+                    environment['independentCpu'] = cpu
+                    environment['devices'].pop('cpu', None)
                     if cpu.get('valid'):
-                        self.environment['devices']['cpu'] = {'name': platform.machine(), 'independent': True}
+                        environment['devices']['cpu'] = {'name': platform.machine(), 'independent': True}
                 hardware = []
                 for card in Path('/sys/class/drm').glob('card[0-9]*/device'):
                     try:
@@ -174,11 +178,12 @@ class AudioModels:
                         processor = subprocess.run(['sysctl', '-n', 'machdep.cpu.brand_string'], capture_output=True, text=True, timeout=2, check=True).stdout.strip()
                 except (OSError, subprocess.SubprocessError):
                     pass
-                if 'cpu' in self.environment.get('devices', {}):
-                    self.environment['devices']['cpu']['name'] = processor or platform.machine()
-                self.environment.update(system=platform.system(), release=platform.release(), architecture=platform.machine(), processor=processor, hardware=hardware, driver=driver, inferenceVersion='3', python=platform.python_version(), build=build_info())
-                self.environment['fingerprint'] = hashlib.sha256(json.dumps(self.environment, sort_keys=True).encode()).hexdigest()
-            return self.environment
+                if 'cpu' in environment.get('devices', {}):
+                    environment['devices']['cpu']['name'] = processor or platform.machine()
+                environment.update(system=platform.system(), release=platform.release(), architecture=platform.machine(), processor=processor, hardware=hardware, driver=driver, inferenceVersion='3', python=platform.python_version(), build=build_info())
+                environment['fingerprint'] = hashlib.sha256(json.dumps(environment, sort_keys=True).encode()).hexdigest()
+            self.environment = environment
+            return environment
 
     def writable(self):
         if not self.repo:
@@ -379,6 +384,7 @@ class AudioModels:
             self.cancel = threading.Event()
             self.operation = {'state': state, 'bytes': 0, 'modelId': model_id}
             self.persist()
+            return self.cancel
 
     def stage(self):
         if not self.model_writable(self.operation.get('modelId', BASELINE)):
@@ -517,25 +523,30 @@ class AudioModels:
                 candidates.sort(key=lambda backend: backend == 'cpu')
                 for backend in candidates:
                     while not self.startup_stop.is_set():
-                        with self.audio.transcoding.lock, self.audio.lock, self.lock:
-                            if self.startup_stop.is_set():
-                                return
+                        # Only inspect scheduling state while holding playback locks.
+                        # Inventory checks and test preparation may spawn slow probes.
+                        with self.audio.transcoding.lock, self.audio.lock:
                             busy = (self.audio.active or time.monotonic() < self.audio.transcoding.realtime_reserved_until
-                                    or any(t.state in ('ACCEPTED', 'RUNNING') for t in self.audio.transcoding.tasks.values())
-                                    or self.operation['state'] in ('DOWNLOADING', 'IMPORTING', 'VERIFYING', 'TESTING'))
-                            self.startup_check = {'state': 'WAITING' if busy else 'TESTING', 'backend': backend}
-                            if not busy:
-                                if any(item['id'] == backend and item['state'] == 'UNVERIFIED' for item in self.entries()):
-                                    self.test(backend)
-                                    trial = self.thread
-                                else:
-                                    trial = None
+                                    or any(t.state in ('ACCEPTED', 'RUNNING') for t in self.audio.transcoding.tasks.values()))
+                        with self.lock:
+                            busy = busy or self.operation['state'] in ('DOWNLOADING', 'IMPORTING', 'VERIFYING', 'TESTING')
+                        self.startup_check = {'state': 'WAITING' if busy else 'TESTING', 'backend': backend}
+                        if not busy:
+                            if not any(item['id'] == backend and item['state'] == 'UNVERIFIED' for item in self.entries()):
                                 break
+                            try:
+                                trial, operation = self._test(backend, startup=True)
+                            except ComputeError as error:
+                                if error.status != 409 or self.startup_stop.is_set():
+                                    raise
+                            else:
+                                trial.join()
+                                if (operation['state'] != 'CANCELLED' and operation.get('error') not in
+                                        ('Realtime playback has priority', 'Audio worker busy')):
+                                    break
                         self.startup_stop.wait(2)
                     else:
                         return
-                    if trial:
-                        trial.join()
                 self.startup_check = {'state': 'COMPLETED'}
             except Exception:
                 self.startup_check = {'state': 'FAILED', 'reason': '自动检测未完成，请重新检测'}
@@ -546,22 +557,42 @@ class AudioModels:
         self.startup_thread.start()
 
     def test(self, backend):
-        environment = self.probe(True)
-        if backend not in ('cpu', 'cuda', 'rocm', 'mps', 'openvino', 'rknn') or backend not in environment.get('devices', {}):
+        _, operation = self._test(backend)
+        return dict(operation)
+
+    def _test(self, backend, *, startup=False):
+        if backend not in ('cpu', 'cuda', 'rocm', 'mps', 'openvino', 'rknn'):
             raise ComputeError(422, 'No qualified runtime for this backend/model')
         model_id = model_for_backend(backend)
-        if not includes_backend(backend) or not self.audio.backend_runtime_available(backend):
-            raise ComputeError(422, 'Install the pinned runtime and model first')
-        qualification_digest = self.inference_digest(model_id)
-        self.begin('TESTING', model_id)
+        # Reserve the model operation before releasing its lock for slow preparation.
+        # Playback can enter meanwhile; the worker must recheck before taking a slot.
+        with self.lock:
+            if startup and self.startup_stop.is_set():
+                raise ComputeError(409, 'Qualification cancelled')
+            cancel = self.begin('TESTING', model_id)
+            operation = self.operation
+        try:
+            environment = self.probe(True)
+            if cancel.is_set():
+                raise ComputeError(409, 'Qualification cancelled')
+            if backend not in environment.get('devices', {}):
+                raise ComputeError(422, 'No qualified runtime for this backend/model')
+            if not includes_backend(backend) or not self.audio.backend_runtime_available(backend):
+                raise ComputeError(422, 'Install the pinned runtime and model first')
+            qualification_digest = self.inference_digest(model_id)
+        except Exception as error:
+            self.failed(error)
+            raise
         def worker():
             task = AudioTask(str(uuid.uuid4()))
-            task.cancel = self.cancel
+            task.cancel = cancel
             task.backend = backend
             acquired = False
             started = time.monotonic()
             try:
                 with self.audio.transcoding.lock, self.audio.lock:
+                    if cancel.is_set():
+                        raise ComputeError(409, 'Qualification cancelled')
                     if time.monotonic() < self.audio.transcoding.realtime_reserved_until or any(t.state in ('ACCEPTED', 'RUNNING') for t in self.audio.transcoding.tasks.values()):
                         raise ComputeError(429, 'Realtime playback has priority')
                     acquired = self.audio.slot.acquire(blocking=False)
@@ -570,6 +601,8 @@ class AudioModels:
                     self.audio.active = True
                     self.audio.tasks[task.id] = task
                 self.check_resources(backend)
+                if cancel.is_set():
+                    raise ComputeError(409, 'Qualification cancelled')
                 with tempfile.TemporaryDirectory(dir=self.root) as temporary:
                     path = Path(temporary) / 'test.wav'
                     with wave.open(str(path), 'wb') as out:
@@ -584,27 +617,31 @@ class AudioModels:
                             raise ComputeError(422, 'Qualification output is not finite')
                     if _rms(vocal) + _rms(backing) < .001:
                         raise ComputeError(422, 'Qualification produced silent stems')
-                if self.cancel.is_set():
+                if cancel.is_set():
                     raise ComputeError(409, 'Qualification cancelled')
                 if self.inference_digest(model_id) != qualification_digest:
                     raise ComputeError(422, 'Model changed during qualification')
-                self.qualified[backend] = {'state': 'AVAILABLE', 'environment': environment['fingerprint'], 'digest': qualification_digest, 'elapsedMs': round((time.monotonic()-started)*1000)}
-                self.operation.update(state='SUCCEEDED', backend=backend)
+                with self.lock:
+                    if cancel.is_set():
+                        raise ComputeError(409, 'Qualification cancelled')
+                    self.qualified[backend] = {'state': 'AVAILABLE', 'environment': environment['fingerprint'], 'digest': qualification_digest, 'elapsedMs': round((time.monotonic()-started)*1000)}
+                    self.operation.update(state='SUCCEEDED', backend=backend)
             except Exception as error:
-                if not self.cancel.is_set() and not (isinstance(error, ComputeError) and error.status == 429):
+                if not cancel.is_set() and not (isinstance(error, ComputeError) and error.status == 429):
                     self.qualified[backend] = {'state': 'FAILED', 'environment': environment['fingerprint'], 'digest': qualification_digest, 'reason': error.message if isinstance(error, ComputeError) else '模型试跑失败'}
                 self.failed(error)
             finally:
-                task.state = 'CANCELLED' if self.cancel.is_set() else 'SUCCEEDED'
+                task.state = 'CANCELLED' if cancel.is_set() else 'SUCCEEDED'
                 if acquired:
                     with self.audio.lock:
                         self.audio.tasks.pop(task.id, None)
                         self.audio.active = False
                         self.audio.slot.release()
                 self.persist()
-        self.thread = threading.Thread(target=worker, daemon=True, name='audio-model-test')
-        self.thread.start()
-        return dict(self.operation)
+        trial = threading.Thread(target=worker, daemon=True, name='audio-model-test')
+        self.thread = trial
+        trial.start()
+        return trial, operation
 
     def check_resources(self, backend):
         available = memory_available()

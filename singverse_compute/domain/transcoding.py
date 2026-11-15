@@ -32,6 +32,11 @@ class Media:
     streams: tuple[Stream, ...]
 
 @dataclass(frozen=True)
+class EncodingResult:
+    mapping: list
+    media: Media | None = None
+
+@dataclass(frozen=True)
 class Client:
     family: str = 'generic'
     containers: tuple[str, ...] = ('mp4',)
