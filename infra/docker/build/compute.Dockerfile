@@ -62,9 +62,14 @@ FROM cpu-fallback AS cuda-runtime
 USER root
 ARG TARGETARCH
 RUN test "$TARGETARCH" = amd64
-RUN python -m pip install --no-cache-dir -r requirements-audio-cuda.lock
-RUN python -m venv /opt/singverse-audio-accelerator && \
-    /opt/singverse-audio-accelerator/bin/python -m pip install --no-cache-dir -r requirements-separation-cuda.lock
+RUN python -m pip install --no-cache-dir -r requirements-audio-cuda.lock && python -m pip check
+# The ONNX worker sees only shared NVIDIA wheels, never the system Torch/ORT
+# packages. Reuse before pip install so duplicate GPU binaries enter no layer.
+RUN --mount=type=bind,source=infra/docker/build/compute/share-cuda-libraries.py,target=/tmp/share-cuda-libraries.py,ro \
+    python -m venv /opt/singverse-audio-accelerator && \
+    python /tmp/share-cuda-libraries.py /opt/singverse-audio-accelerator requirements-separation-cuda.lock && \
+    /opt/singverse-audio-accelerator/bin/python -m pip install --no-cache-dir -r requirements-separation-cuda.lock && \
+    /opt/singverse-audio-accelerator/bin/python -m pip check
 ENV COMPUTE_AUDIO_ACCELERATOR_PYTHON=/opt/singverse-audio-accelerator/bin/python
 ENV SINGVERSE_COMPUTE_VARIANT=cuda NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 USER 10001:10001
@@ -73,16 +78,11 @@ FROM cpu-fallback AS rocm-runtime
 USER root
 ARG TARGETARCH
 RUN test "$TARGETARCH" = amd64
-RUN python -m pip install --no-cache-dir -r requirements-audio-rocm.lock
-# Install gfx1103 in the final stage, after general ROCm, with an isolated venv.
-# A separate stage plus COPY duplicates this large runtime on the runner disk.
-RUN --mount=type=cache,id=singverse-compute-pip,target=/root/.cache/pip,sharing=locked \
-    python -m venv /opt/singverse-audio-rocm-gfx1103 && \
-    /opt/singverse-audio-rocm-gfx1103/bin/python -m pip install -r requirements.lock
-RUN /opt/singverse-audio-rocm-gfx1103/bin/python -m pip install --no-cache-dir --no-build-isolation -r requirements-audio-rocm-native.lock && \
-    /opt/singverse-audio-rocm-gfx1103/bin/python -m pip check
+# One pinned multi-architecture Torch/SDK, including the native gfx1103 packs.
+# No legacy ROCm 6.2 stack or second GPU venv is copied into this image.
+RUN python -m pip install --no-cache-dir --no-build-isolation -r requirements-audio-rocm.lock && \
+    python -m pip check
 ENV SINGVERSE_COMPUTE_VARIANT=rocm \
-    COMPUTE_AUDIO_ROCM_GFX1103_PYTHON=/opt/singverse-audio-rocm-gfx1103/bin/python \
     HOME=/tmp USER=singverse LOGNAME=singverse
 USER 10001:10001
 

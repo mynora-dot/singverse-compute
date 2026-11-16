@@ -1,5 +1,19 @@
-# Linux x86_64 only; install into the project venv/container explicitly.
---extra-index-url https://download.pytorch.org/whl/rocm6.2
--r requirements-audio-common.lock
-torch==2.5.1+rocm6.2
-torchaudio==2.5.1+rocm6.2
+# Linux x86_64 / Python 3.12: one shared ROCm 10.0.0 / Torch 2.11 runtime.
+# Reuse the pinned common libraries and native gfx1103 packs exactly once.
+# Additional architecture wheel hashes were measured from the official stable
+# AMD files; they pin full artifact bytes, not publisher checksum claims.
+-r requirements-audio-rocm-native.lock
+amd-torch-device-gfx1030 @ https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx1030/amd_torch_device_gfx1030-2.11.0%2Brocm10.0.0-cp312-cp312-linux_x86_64.whl#sha256=4df064efd05b927654033bd1ee88402f87c592b4eee47dcc0051eb914b640bf6
+amd-torch-device-gfx1100 @ https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx1100/amd_torch_device_gfx1100-2.11.0%2Brocm10.0.0-cp312-cp312-linux_x86_64.whl#sha256=0f59864d8f11acd6eaff20cb01314641f28787088407f67df01034e657a52e95
+amd-torch-device-gfx1101 @ https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx1101/amd_torch_device_gfx1101-2.11.0%2Brocm10.0.0-cp312-cp312-linux_x86_64.whl#sha256=65667b455d0e8515be43f5c4d533ef98ed0b2c557784ed89a3e73a103e7f187f
+amd-torch-device-gfx1102 @ https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx1102/amd_torch_device_gfx1102-2.11.0%2Brocm10.0.0-cp312-cp312-linux_x86_64.whl#sha256=f2a5d9d795a9d3a78a0d467b4f7bad3e637a0cee34214856b577b5f93fd5cb86
+amd-torch-device-gfx908 @ https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx908/amd_torch_device_gfx908-2.11.0%2Brocm10.0.0-cp312-cp312-linux_x86_64.whl#sha256=2ca358578c1daffa0e8e3413b18d4961df3e553c86bd5a5c15de0a2da429412f
+amd-torch-device-gfx90a @ https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx90a/amd_torch_device_gfx90a-2.11.0%2Brocm10.0.0-cp312-cp312-linux_x86_64.whl#sha256=0847c599203fbceb714692bac45b595faca94138cb419ad550746a2f5f78d411
+amd-torch-device-gfx942 @ https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx942/amd_torch_device_gfx942-2.11.0%2Brocm10.0.0-cp312-cp312-linux_x86_64.whl#sha256=23585042a1e862cb6be16eb085c77804c5de87e892763ed6ccb1dc138efdb5d5
+rocm-sdk-device-gfx1030 @ https://stable.repo.amd.com/rocm/whl-next/rocm-sdk-device-gfx1030/rocm_sdk_device_gfx1030-10.0.0-py3-none-linux_x86_64.whl#sha256=493cf38e23d970afab6e21df09a68ce678a5d28a8107d7fd2841c90a557369f6
+rocm-sdk-device-gfx1100 @ https://stable.repo.amd.com/rocm/whl-next/rocm-sdk-device-gfx1100/rocm_sdk_device_gfx1100-10.0.0-py3-none-linux_x86_64.whl#sha256=d44af24724dd1a104a973a8dbc2eb514c1a0c155ac2cf5bf38cc9ab5846f8f29
+rocm-sdk-device-gfx1101 @ https://stable.repo.amd.com/rocm/whl-next/rocm-sdk-device-gfx1101/rocm_sdk_device_gfx1101-10.0.0-py3-none-linux_x86_64.whl#sha256=3e5c648e0b0291863536732bc3e90198903b2a4907e2806d1b41e8fb4f9d4a2d
+rocm-sdk-device-gfx1102 @ https://stable.repo.amd.com/rocm/whl-next/rocm-sdk-device-gfx1102/rocm_sdk_device_gfx1102-10.0.0-py3-none-linux_x86_64.whl#sha256=dbfc6d85cd64c625555084714302467d8a46a98c05bba9f62f91b49e178af901
+rocm-sdk-device-gfx908 @ https://stable.repo.amd.com/rocm/whl-next/rocm-sdk-device-gfx908/rocm_sdk_device_gfx908-10.0.0-py3-none-linux_x86_64.whl#sha256=35fff75186b81ff46499522928abb4d46efe53cbe20b8e53c40941f28c62c7ec
+rocm-sdk-device-gfx90a @ https://stable.repo.amd.com/rocm/whl-next/rocm-sdk-device-gfx90a/rocm_sdk_device_gfx90a-10.0.0-py3-none-linux_x86_64.whl#sha256=8bb0e955378aae4e7962ddd55661782e9e2843101b3c15dd6f9a0c7568d4b0bb
+rocm-sdk-device-gfx942 @ https://stable.repo.amd.com/rocm/whl-next/rocm-sdk-device-gfx942/rocm_sdk_device_gfx942-10.0.0-py3-none-linux_x86_64.whl#sha256=636f4e4c3110e4e1ccc9eacb08ef39e08f635ba9472ead2b000bedd76bfea8bd

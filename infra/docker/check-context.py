@@ -16,6 +16,7 @@ with tempfile.TemporaryDirectory(prefix="singverse-compute-context-") as directo
         "requirements.lock": "locked",
         "singverse_compute/core/config.py": "source",
         "infra/docker/build/compute/install-opencl.sh": "source",
+        "infra/docker/build/compute/share-cuda-libraries.py": "source",
         ".env": "isolated-fixture", ".tools/private.pem": "isolated-fixture",
         ".venv/credential": "isolated-fixture", "data/test.db": "isolated-fixture",
         "singverse_compute/core/build.json": "isolated-fixture",

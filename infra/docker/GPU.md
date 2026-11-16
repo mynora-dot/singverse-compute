@@ -5,11 +5,15 @@
 | 运行库 | 镜像架构 | 硬件覆盖 / 用途 |
 |---|---|---|
 | cuda | AMD64 | `compose.nvidia.yaml`；兼容 NVIDIA 驱动和 Container Toolkit |
-| rocm | AMD64 | `compose.rocm.yaml`；通用 ROCm 与独立 gfx1103 运行库合并在同一镜像，按设备探测选择 |
+| rocm | AMD64 | `compose.rocm.yaml`；统一 ROCm / PyTorch 运行库，按真实显卡架构加载对应设备包 |
 | openvino | AMD64 | `compose.dri.yaml`；Intel 推理，视频 QSV 单独选择 |
 | rknn | ARM64 | `compose.rknn.yaml`；匹配的瑞芯微 BSP、运行库和已转换模型 |
 
 四种镜像均包含 FFmpeg、媒体探测和独立 CPU 降级环境；CPU 不单独发布，也不作为可手动选用的 AI 设备。加速不可用或执行失败时，按共享 `cpuFallback` 开关使用已试跑的 CPU，关闭后不降级。视频 NVIDIA 使用 `compose.nvidia.yaml`，VAAPI/QSV 使用 `compose.dri.yaml`，瑞芯微 MPP/RGA 使用 `compose.rockchip.yaml`。RKNN 音频 NPU 与 MPP 视频映射不能相互替代。
+
+ROCm 镜像固定 PyTorch / torchaudio `2.11.0+rocm10.0.0`，共享一套 SDK 10.0.0（HIP 7.15.26333），内置 `gfx908`、`gfx90a`、`gfx942`、`gfx1030`、`gfx1100`、`gfx1101`、`gfx1102`、`gfx1103` 设备包。公共库只安装一次，gfx1103 不再使用第二套 GPU 虚拟环境。设备探测和推理均校验真实架构、已安装设备包的精确版本以及 Torch 编译架构；不通过架构伪装声明兼容。列表之外的 GPU 不宣称支持；安装了设备包也仍需在目标主机试跑并确认宿主驱动兼容，不能用 GitHub 构建成功代替硬件验收。
+
+CUDA 镜像保持原有 PyTorch、CUDA 12.4、cuDNN 9 与 ONNX Runtime 版本；ONNX GPU 环境通过只指向 NVIDIA 包的符号链接复用主环境的动态库及包元数据，安装前检查锁定版本，安装后执行 `pip check`。不启用整个系统 site-packages，独立 CPU 环境不包含这些链接。
 
 ## 同机 GPU
 

@@ -196,7 +196,9 @@ SINGVERSE_TEST_FAST_MODEL_REPO="$PWD/.tools/demucs-htdemucs" \
 ```
 
 
-常规模型运行时固定为 Demucs 4.0.1、torch/torchaudio 2.5.1；CPU依赖见 `requirements-audio.lock`，Linux x86_64 CUDA 12.4 / ROCm 6.2 分别见 `requirements-audio-cuda.lock` / `requirements-audio-rocm.lock`。gfx1103 的原生 ROCm 配置独立固定为 torch/torchaudio `2.11.0+rocm10.0.0`，见 `requirements-audio-rocm-native.lock`，不替换其它后端。原生节点先执行 `make compute-setup`，CPU/Mac可用 `make compute-audio-setup`（同时显式下载模型到 `.tools/demucs-htdemucs`）；CUDA/旧 ROCm 分别执行 `make compute-audio-cuda-setup` / `make compute-audio-rocm-setup`，Linux x86_64 / Python 3.12 的 gfx1103 节点使用 `make compute-audio-rocm-native-setup`（均仅安装环境）。节点不能在 HTTP 请求中安装 Python 依赖或驱动。
+模型运行时固定为 Demucs 4.0.1。CPU/Mac 与 CUDA 保持 torch/torchaudio 2.5.1，依赖分别见 `requirements-audio.lock` / `requirements-audio-cuda.lock`；CUDA 使用 12.4。ROCm 统一为 torch/torchaudio `2.11.0+rocm10.0.0` 和一套共享 SDK，`requirements-audio-rocm.lock` 包含固定版本及摘要的多个架构包，范围见 [GPU.md](infra/docker/GPU.md)。仅安装 gfx1103 的原生节点仍可使用 `requirements-audio-rocm-native.lock`，无需通用多架构包。
+
+原生节点先执行 `make compute-setup`，CPU/Mac可用 `make compute-audio-setup`（同时显式下载模型到 `.tools/demucs-htdemucs`）；CUDA / ROCm 分别执行 `make compute-audio-cuda-setup` / `make compute-audio-rocm-setup`，仅 gfx1103 可使用 `make compute-audio-rocm-native-setup`（均仅安装环境）。ROCm 两种配置均要求 Linux x86_64 / Python 3.12；不会修改 CPU/Mac 或 CUDA 依赖。节点不能在 HTTP 请求中安装 Python 依赖或驱动。
 
 ### 深度识别与伴奏分离
 

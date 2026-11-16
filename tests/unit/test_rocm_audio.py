@@ -1,5 +1,6 @@
 """Native runtime, trusted weight loading and explicit device/PCM contracts; CPU tests are not GPU qualification."""
 from contextlib import redirect_stdout
+from importlib.metadata import PackageNotFoundError
 import importlib.util
 import io
 import json
@@ -10,10 +11,20 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from singverse_compute.core.audio_runtime import audio_runtime_profile, NATIVE_ROCM_PACKAGES
+from singverse_compute.core.audio_runtime import (audio_runtime_profile, native_rocm_architectures,
+    NATIVE_ROCM_PACKAGES, NATIVE_ROCM_COMMON_PACKAGES, NATIVE_ROCM_DEVICE_PACKAGES)
 from singverse_compute.core.build_info import includes_backend
 from singverse_compute.application.audio_roles import AudioRoles
 from singverse_compute.infrastructure.rocm_audio import load_official_model, separate
+
+
+def installed_versions(packages):
+    def lookup(name):
+        try:
+            return packages[name]
+        except KeyError as error:
+            raise PackageNotFoundError(name) from error
+    return lookup
 
 
 class AudioRuntimeProfileTest(unittest.TestCase):
@@ -23,21 +34,33 @@ class AudioRuntimeProfileTest(unittest.TestCase):
             with patch('singverse_compute.core.audio_runtime.version', side_effect=packages.__getitem__):
                 self.assertEqual(audio_runtime_profile(), 'legacy')
         packages = {'demucs': '4.0.1', **NATIVE_ROCM_PACKAGES}
-        with patch('singverse_compute.core.audio_runtime.version', side_effect=packages.__getitem__):
+        with patch('singverse_compute.core.audio_runtime.version', side_effect=installed_versions(packages)):
             self.assertEqual(audio_runtime_profile(), 'rocm-native')
 
     def test_mixed_or_missing_device_libraries_are_not_accepted(self):
-        from importlib.metadata import PackageNotFoundError
         for name in ('torch', 'torchaudio', 'rocm-sdk-core', 'amd-torch-device-gfx1103', 'amd-torch-device-gfx110x'):
             packages = {'demucs': '4.0.1', **NATIVE_ROCM_PACKAGES, name: 'unverified'}
-            with self.subTest(package=name), patch('singverse_compute.core.audio_runtime.version', side_effect=packages.__getitem__):
+            with self.subTest(package=name), patch('singverse_compute.core.audio_runtime.version', side_effect=installed_versions(packages)):
                 self.assertIsNone(audio_runtime_profile())
         def missing(name):
             if name == 'rocm-sdk-device-gfx1103':
                 raise PackageNotFoundError(name)
-            return {'demucs': '4.0.1', **NATIVE_ROCM_PACKAGES}[name]
+            return installed_versions({'demucs': '4.0.1', **NATIVE_ROCM_PACKAGES})(name)
         with patch('singverse_compute.core.audio_runtime.version', side_effect=missing):
             self.assertIsNone(audio_runtime_profile())
+
+    def test_shared_rocm_runtime_accepts_only_complete_matching_device_packs(self):
+        packages = {'demucs': '4.0.1', **NATIVE_ROCM_COMMON_PACKAGES}
+        for architecture in ('gfx1030', 'gfx1100', 'gfx1103', 'gfx942'):
+            packages.update(NATIVE_ROCM_DEVICE_PACKAGES[architecture])
+        packages['amd-torch-device-gfx1100'] = 'unverified'
+        with patch('singverse_compute.core.audio_runtime.version', side_effect=installed_versions(packages)):
+            self.assertEqual(audio_runtime_profile(), 'rocm-native')
+            self.assertEqual(set(native_rocm_architectures()), {'gfx1030', 'gfx1103', 'gfx942'})
+        # gfx1103 is optional for other GPUs; they still need their own complete pack.
+        packages.pop('rocm-sdk-device-gfx1103')
+        with patch('singverse_compute.core.audio_runtime.version', side_effect=installed_versions(packages)):
+            self.assertEqual(set(native_rocm_architectures()), {'gfx1030', 'gfx942'})
 
     def test_native_image_only_adds_its_real_backend(self):
         with patch('singverse_compute.core.build_info.build_info', return_value={'variant': 'rocm-native'}):
@@ -102,6 +125,53 @@ class AudioRuntimeProfileTest(unittest.TestCase):
             self.assertIn('singverse_compute.infrastructure.rocm_audio', command)
             self.assertEqual(command[command.index('--backend') + 1], 'rocm')
             self.assertIn('--backing-only', command)
+
+
+class NativeRocmDeviceTest(unittest.TestCase):
+    def torch(self, architecture, compiled):
+        return SimpleNamespace(version=SimpleNamespace(hip='7.15.26333', cuda=None),
+            device=lambda value: value, cuda=SimpleNamespace(is_available=lambda: True,
+            get_device_properties=lambda _: SimpleNamespace(gcnArchName=architecture + ':xnack-'),
+            get_arch_list=lambda: compiled))
+
+    def test_shared_runtime_keeps_explicit_gpu_placement_for_each_architecture(self):
+        from singverse_compute.infrastructure.rocm_audio import _device
+        for architecture in NATIVE_ROCM_DEVICE_PACKAGES:
+            with self.subTest(architecture=architecture), \
+                 patch.dict('sys.modules', {'torch': self.torch(architecture, [architecture + ':xnack-'])}), \
+                 patch('singverse_compute.infrastructure.rocm_audio.audio_runtime_profile', return_value='rocm-native'), \
+                 patch('singverse_compute.infrastructure.rocm_audio.native_rocm_architectures', return_value=(architecture,)), \
+                 patch.dict(os.environ, {'HSA_OVERRIDE_GFX_VERSION': ''}):
+                self.assertEqual(_device('rocm'), 'cuda:0')
+
+    def test_missing_pack_or_compiled_architecture_rejects_gpu_instead_of_using_cpu(self):
+        from singverse_compute.infrastructure.rocm_audio import _device
+        for installed, compiled in [(('gfx1103',), ['gfx1030']), (('gfx1030',), ['gfx1103'])]:
+            with self.subTest(installed=installed, compiled=compiled), \
+                 patch.dict('sys.modules', {'torch': self.torch('gfx1030', compiled)}), \
+                 patch('singverse_compute.infrastructure.rocm_audio.audio_runtime_profile', return_value='rocm-native'), \
+                 patch('singverse_compute.infrastructure.rocm_audio.native_rocm_architectures', return_value=installed), \
+                 patch.dict(os.environ, {'HSA_OVERRIDE_GFX_VERSION': ''}):
+                with self.assertRaisesRegex(RuntimeError, 'device libraries for gfx1030'):
+                    _device('rocm')
+
+    def test_probe_does_not_advertise_a_gpu_without_matching_device_libraries(self):
+        from singverse_compute.application.audio_models import PROBE
+        for installed, expected in [(('gfx1030', 'gfx1103'), True), (('gfx1103',), False)]:
+            torch = self.torch('gfx1030', ['gfx1030'])
+            torch.backends = SimpleNamespace()
+            output = io.StringIO()
+            with self.subTest(installed=installed), redirect_stdout(output), \
+                 patch.dict('sys.modules', {'torch': torch, 'openvino': None, 'rknnlite': None}), \
+                 patch('importlib.metadata.version', return_value='pinned'), \
+                 patch('singverse_compute.core.audio_runtime.audio_runtime_profile', return_value='rocm-native'), \
+                 patch('singverse_compute.core.audio_runtime.native_rocm_architectures', return_value=installed):
+                torch.cuda.get_device_properties = lambda _: SimpleNamespace(
+                    name='AMD GPU', total_memory=1024, gcnArchName='gfx1030')
+                exec(PROBE, {})
+            result = json.loads(output.getvalue())
+            self.assertEqual('rocm' in result['devices'], expected)
+            self.assertIn('cpu', result['devices'])
 
 
 @unittest.skipUnless(importlib.util.find_spec('torch'), 'Optional audio runtime required')

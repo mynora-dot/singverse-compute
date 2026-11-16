@@ -65,8 +65,13 @@ try:
  if platform.system() == 'Linux' and platform.machine() == 'aarch64' and any(x in compatible for x in ('rk3588','rk3566','rk3568')):
   out['devices']['rknn']={'name':'Rockchip NPU', 'runtime':out['versions']['rknn-toolkit-lite2']}
 except Exception: pass
-from singverse_compute.core.audio_runtime import audio_runtime_profile
+from singverse_compute.core.audio_runtime import audio_runtime_profile, native_rocm_architectures
 out['audioRuntimeProfile']=audio_runtime_profile()
+if out['audioRuntimeProfile']=='rocm-native' and 'rocm' in out['devices']:
+ architecture=out['devices']['rocm']['architecture']
+ if architecture not in native_rocm_architectures() or architecture not in [a.split(':')[0] for a in torch.cuda.get_arch_list()]:
+  out['devices'].pop('rocm')
+  out['error']='ROCM_DEVICE_LIBRARIES_MISSING_OR_INCOMPATIBLE'
 print(json.dumps(out))'''
 
 
@@ -153,9 +158,9 @@ class AudioModels:
                                                  memory_limit=self.audio.settings.audio_memory_bytes))
                 except Exception:
                     environment = {'devices': {}, 'versions': {}, 'error': 'RUNTIME_MISSING_OR_INCOMPATIBLE'}
-                # One public ROCm image preserves both general AMD wheels and the
-                # isolated gfx1103 runtime. Qualification and inference must use
-                # the same interpreter; importing either stays outside the API.
+                # Compatibility for older two-runtime deployments. Current ROCm
+                # images use one main interpreter with matching device packs.
+                # GPU imports always stay outside the API process.
                 native_python = os.environ.get('COMPUTE_AUDIO_ROCM_GFX1103_PYTHON')
                 rocm = environment.get('devices', {}).get('rocm', {})
                 if native_python and (not rocm or rocm.get('architecture') == 'gfx1103'):

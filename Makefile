@@ -48,8 +48,9 @@ compute-audio-cuda-setup:
 
 
 compute-audio-rocm-setup:
-	.venv/bin/python -c "import platform; assert platform.system() == 'Linux' and platform.machine() == 'x86_64', 'ROCm package targets Linux x86_64'"
-	.venv/bin/python -m pip install -r requirements-audio-rocm.lock
+	.venv/bin/python -c "import platform,sys; assert platform.system() == 'Linux' and platform.machine() == 'x86_64' and sys.version_info[:2] == (3,12), 'ROCm package targets Linux x86_64 / Python 3.12'"
+	.venv/bin/python -m pip install --no-build-isolation -r requirements-audio-rocm.lock
+	.venv/bin/python -m pip check
 
 
 compute-audio-rocm-native-setup:

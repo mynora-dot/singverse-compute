@@ -1,4 +1,4 @@
-"""Native gfx1103 Demucs adapter with explicit device and verified, offline model loading."""
+"""Native ROCm Demucs adapter with explicit device and verified, offline model loading."""
 import argparse
 import hashlib
 import json
@@ -10,7 +10,7 @@ import sys
 from contextlib import ExitStack
 
 from ..application.audio_catalog import BASELINE, manifest
-from ..core.audio_runtime import audio_runtime_profile
+from ..core.audio_runtime import audio_runtime_profile, native_rocm_architectures
 
 
 def load_official_model(model_dir):
@@ -63,14 +63,17 @@ def _device(backend):
         raise RuntimeError('Forged GPU architecture overrides are forbidden')
     if not torch.version.hip or torch.version.cuda:
         raise RuntimeError('Expected an unambiguous HIP runtime')
+    if backend not in ('rocm', 'cpu'):
+        raise RuntimeError('The native ROCm runtime cannot execute a different GPU backend')
     device = torch.device('cuda:0' if backend == 'rocm' else 'cpu')
     if backend == 'rocm':
         if not torch.cuda.is_available():
             raise RuntimeError('ROCm GPU is unavailable; CPU inference was not requested')
         properties = torch.cuda.get_device_properties(device)
         architecture = properties.gcnArchName.split(':')[0]
-        if architecture != 'gfx1103' or architecture not in [value.split(':')[0] for value in torch.cuda.get_arch_list()]:
-            raise RuntimeError('This native ROCm image requires a real gfx1103 GPU and matching device libraries')
+        if (architecture not in native_rocm_architectures()
+                or architecture not in [value.split(':')[0] for value in torch.cuda.get_arch_list()]):
+            raise RuntimeError(f'No matching pinned native ROCm device libraries for {architecture}')
     return device
 
 

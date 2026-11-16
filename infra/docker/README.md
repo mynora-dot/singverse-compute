@@ -64,7 +64,11 @@ make docker-up
 
 构建与发布 job 在恢复大归档之前运行 `infra/docker/prepare-runner.sh`，仅在临时 GitHub-hosted Linux runner 上清理不用的 SDK、浏览器和云 CLI，并输出实际释放空间；保留 Python、Node、Git、gh、Docker、Skopeo 与 swap。轻量预检和 Mac 安装包打包任务不做清理，不改分区或合并磁盘。
 
-普通依赖使用 BuildKit pip 缓存挂载，CUDA、ROCm 等加速运行库安装禁用大 wheel 下载缓存。ROCm 通用运行库与 gfx1103 独立虚拟环境顺序安装，避免复制整套运行库产生额外磁盘峰值；两套 AMD 运行库及 CPU 自动降级均保留。源码、版本元数据在四个最终阶段才加入，因此仅改代码或版本不再使 GPU 依赖层失效。
+普通依赖使用 BuildKit pip 缓存挂载，CUDA、ROCm 等加速运行库安装禁用大 wheel 下载缓存。CUDA 的 PyTorch 与 ONNX GPU worker 共用一份锁定版本的 NVIDIA 动态库，在 pip 安装前建立包及元数据链接，避免重复的大库进入任何镜像层；ONNX 仍使用隔离的虚拟环境，安装后执行 `pip check`。CPU 自动降级使用独立环境，不共享 GPU 库。
+
+ROCm 移除旧的 PyTorch 2.5.1 / ROCm 6.2 栈及额外 gfx1103 GPU 虚拟环境，统一使用原生配置已有的 PyTorch / torchaudio `2.11.0+rocm10.0.0` 和一套 SDK 公共库，再安装固定的设备包。具体架构范围见 [GPU.md](GPU.md)；各新增 wheel 同样通过完整文件 SHA-256 固定内容。既不使用浮动 nightly，也不把所有新架构盲目打入镜像。实际压缩体积需新版本构建后确认，设备包本身仍可能较大。
+
+源码、版本元数据在四个最终阶段才加入，因此仅改代码或版本不使 GPU 依赖层失效。上述精简不新增 Actions Variables / Secrets，也不改变四类镜像、8 个标签和双仓库发布规则。
 
 跨版本的构建层缓存存放于 `ghcr.io/<GHCR_NAMESPACE>/singverse-compute-buildcache:<runtime>-<arch>`，使用 registry cache 的 `mode=max`，按运行库和架构隔离。缓存包由现有 GHCR 凭据创建，不需要新增 Actions 参数；已有包需允许本仓库 Actions 读写，跨 owner 的自定义凭据也需覆盖缓存包。缓存不向 Docker Hub 复制，正式 `singverse-compute` 仍每个版本只有 8 个标签。缺失缓存正常构建，缓存导出失败不阻断正式产物，正式产物或归档保存失败仍停止发布。首次构建需要填充缓存；后续依赖层不变时才能复用。
 

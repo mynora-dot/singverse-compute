@@ -1,4 +1,6 @@
 # Isolated GPU worker; keep the separately installed CPU environment.
+# Docker shares these exact NVIDIA wheels with Torch before installing this lock.
+# Standalone venv installation still installs all five libraries normally.
 numpy==1.26.4
 soundfile==0.13.1
 cffi==2.1.1
