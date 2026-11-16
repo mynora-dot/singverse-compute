@@ -317,7 +317,7 @@ ROCm 6.2 的现有轮子缺少这台 gfx1103 所需的原生算子库，不能�
 
 Dockerfile 和 OpenCL 安装资源统一位于 `infra/docker/build/`。`make compute-images COMPUTE_RUNTIME=cuda` 构建单个运行库（按硬件选择四种变体）；独立节点源码路线使用 compute 基础配置加 compute-build 覆盖，镜像路线只用基础配置，详见[计算节点部署](infra/docker/GPU.md)。
 
-GHCR、Docker Hub 和阿里云统一通过 `.github/workflows/singverse-compute-images.yml` 发布。仅在正式 GitHub Release 发布后构建和上传，版本来自标签，项目空间使用仓库 Variables；普通 push/PR 不运行自动检查。部署 `IMAGE_PREFIX` 对应实际仓库域名/命名空间；凭据、镜像地址和不可变标签规则见[镜像发布](infra/docker/README.md)。不再提供业务或计算源码 ZIP、离线镜像 ZIP，模型本身的离线导入能力仍保留。
+GHCR 和 Docker Hub统一通过 `.github/workflows/singverse-compute-images.yml` 发布。仅在正式 GitHub Release 发布后构建和上传，版本来自标签，项目空间使用仓库 Variables；普通 push/PR 不运行自动检查。部署 `IMAGE_PREFIX` 对应实际仓库域名/命名空间；凭据、镜像地址和不可变标签规则见[镜像发布](infra/docker/README.md)。不再提供业务或计算源码 ZIP、离线镜像 ZIP，模型本身的离线导入能力仍保留。
 
 ### Intel 官方转换模型和离线包
 

@@ -1,4 +1,15 @@
 ARG PYTHON_IMAGE=python:3.12-slim-bookworm@sha256:e697c81897302a4c4333bade000d98038fbb21eb064f8ee1fd42d02ebcd9d337
+# Keep changing source/version metadata out of the expensive runtime stages.
+FROM ${PYTHON_IMAGE} AS source
+WORKDIR /opt/singverse-compute
+COPY requirements*.lock ./
+COPY singverse_compute/ ./singverse_compute/
+ARG SINGVERSE_VERSION=0.0.0
+ARG SOURCE_REVISION=local
+RUN python -c "import json,os,hashlib,pathlib; p=pathlib.Path('singverse_compute/core/build.json'); p.write_text(json.dumps(dict(version=os.environ['SINGVERSE_VERSION'],revision=os.environ['SOURCE_REVISION'],variant='internal',runtimeLock=hashlib.sha256(b''.join(f.read_bytes() for f in sorted(pathlib.Path('.').glob('requirements*.lock')))).hexdigest(),sourceDigest=hashlib.sha256(b''.join(str(f).encode()+f.read_bytes() for f in sorted(pathlib.Path('singverse_compute').rglob('*.py')))).hexdigest())))" && \
+    find singverse_compute -type d -exec chmod 755 {} + && \
+    find singverse_compute -type f -exec chmod 644 {} +
+
 FROM ${PYTHON_IMAGE} AS common
 ARG TARGETARCH
 # Official Jellyfin release assets, pinned by version AND SHA-256.
@@ -16,31 +27,22 @@ RUN --mount=type=cache,id=singverse-compute-apt,target=/var/cache/apt,sharing=lo
     rm -f /tmp/jellyfin-ffmpeg.deb && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/singverse-compute
 COPY requirements*.lock ./
-RUN --mount=type=cache,target=/root/.cache/pip python -m pip install -r requirements.lock
+# Share ordinary downloads between isolated venvs without baking them into layers.
+RUN --mount=type=cache,id=singverse-compute-pip,target=/root/.cache/pip,sharing=locked \
+    python -m pip install -r requirements.lock
 # Driver-independent ONNX CPU worker is present even in accelerator images.
-RUN --mount=type=cache,target=/root/.cache/pip python -m venv /opt/singverse-audio-cpu && \
+RUN --mount=type=cache,id=singverse-compute-pip,target=/root/.cache/pip,sharing=locked \
+    python -m venv /opt/singverse-audio-cpu && \
     /opt/singverse-audio-cpu/bin/python -m pip install -r requirements-separation-cpu.lock && \
     /opt/singverse-audio-cpu/bin/python -m pip check
 ENV COMPUTE_AUDIO_CPU_PYTHON=/opt/singverse-audio-cpu/bin/python
-COPY singverse_compute/ ./singverse_compute/
 RUN chmod 755 /opt/singverse-compute && \
-    find /opt/singverse-compute/singverse_compute -type d -exec chmod 755 {} + && \
-    find /opt/singverse-compute/singverse_compute -type f -exec chmod 644 {} +
+    chmod 644 /opt/singverse-compute/requirements*.lock
 RUN mkdir -p /run/singverse-compute /var/cache/singverse-transcode /var/lib/singverse-models && chown 10001:10001 /run/singverse-compute /var/cache/singverse-transcode /var/lib/singverse-models
 ENV PATH="/usr/lib/jellyfin-ffmpeg:${PATH}"
 ENV COMPUTE_AUTH_TOKEN_FILE=/run/singverse-compute/token \
     COMPUTE_TRANSCODE_ROOT=/var/cache/singverse-transcode \
     COMPUTE_FFMPEG=/usr/lib/jellyfin-ffmpeg/ffmpeg COMPUTE_FFPROBE=/usr/lib/jellyfin-ffmpeg/ffprobe
-ARG SINGVERSE_VERSION=0.0.0
-ARG SOURCE_REVISION=local
-RUN python -c "import json,os,hashlib,pathlib; p=pathlib.Path('singverse_compute/core/build.json'); p.write_text(json.dumps(dict(version=os.environ['SINGVERSE_VERSION'],revision=os.environ['SOURCE_REVISION'],variant='internal',runtimeLock=hashlib.sha256(b''.join(f.read_bytes() for f in sorted(pathlib.Path('.').glob('requirements*.lock')))).hexdigest(),sourceDigest=hashlib.sha256(b''.join(str(f).encode()+f.read_bytes() for f in sorted(pathlib.Path('singverse_compute').rglob('*.py')))).hexdigest())))"
-# Generated metadata comes after COPY normalization; normalize it and every lock
-# explicitly even when the builder/extractor uses umask 077.
-RUN chmod 644 /opt/singverse-compute/requirements*.lock /opt/singverse-compute/singverse_compute/core/build.json
-LABEL org.opencontainers.image.title="SingVerse Compute" \
-      org.singverse.image.version-source="release-tag" \
-      org.opencontainers.image.version="${SINGVERSE_VERSION}" \
-      org.opencontainers.image.revision="${SOURCE_REVISION}"
 USER 10001:10001
 RUN python -c "from pathlib import Path; [p.read_bytes() for p in Path('.').glob('requirements*.lock')]"
 HEALTHCHECK --interval=5s --timeout=3s --start-period=20s --retries=6 \
@@ -50,56 +52,91 @@ CMD ["python", "-m", "singverse_compute", "--host", "0.0.0.0", "--port", "8090"]
 # Every accelerator image includes the same driver-independent CPU fallback.
 FROM common AS cpu-fallback
 USER root
-RUN --mount=type=cache,target=/root/.cache/pip /opt/singverse-audio-cpu/bin/python -m pip install -r requirements-audio.lock && \
+RUN --mount=type=cache,id=singverse-compute-pip,target=/root/.cache/pip,sharing=locked \
+    /opt/singverse-audio-cpu/bin/python -m pip install -r requirements-audio.lock && \
     /opt/singverse-audio-cpu/bin/python -m pip check
 USER 10001:10001
 
-# AMD gfx1103 uses an isolated pinned runtime alongside the general ROCm wheels.
-# This is an internal dependency stage, not a separately published image.
-FROM common AS rocm-gfx1103-deps
-USER root
-RUN --mount=type=cache,target=/root/.cache/pip python -m venv /opt/singverse-audio-rocm-gfx1103 && \
-    /opt/singverse-audio-rocm-gfx1103/bin/python -m pip install -r requirements.lock && \
-    /opt/singverse-audio-rocm-gfx1103/bin/python -m pip install --no-build-isolation -r requirements-audio-rocm-native.lock && \
-    /opt/singverse-audio-rocm-gfx1103/bin/python -m pip check
-
 # Runtime variants contain no model weights. Download/import is an administrator operation.
-FROM cpu-fallback AS cuda
+FROM cpu-fallback AS cuda-runtime
 USER root
 ARG TARGETARCH
 RUN test "$TARGETARCH" = amd64
-RUN --mount=type=cache,target=/root/.cache/pip python -m pip install -r requirements-audio-cuda.lock
-RUN --mount=type=cache,target=/root/.cache/pip python -m venv /opt/singverse-audio-accelerator && \
-    /opt/singverse-audio-accelerator/bin/python -m pip install -r requirements-separation-cuda.lock
+RUN python -m pip install --no-cache-dir -r requirements-audio-cuda.lock
+RUN python -m venv /opt/singverse-audio-accelerator && \
+    /opt/singverse-audio-accelerator/bin/python -m pip install --no-cache-dir -r requirements-separation-cuda.lock
 ENV COMPUTE_AUDIO_ACCELERATOR_PYTHON=/opt/singverse-audio-accelerator/bin/python
 ENV SINGVERSE_COMPUTE_VARIANT=cuda NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 USER 10001:10001
 
-FROM cpu-fallback AS rocm
+FROM cpu-fallback AS rocm-runtime
 USER root
 ARG TARGETARCH
 RUN test "$TARGETARCH" = amd64
-RUN --mount=type=cache,target=/root/.cache/pip python -m pip install -r requirements-audio-rocm.lock
-COPY --from=rocm-gfx1103-deps /opt/singverse-audio-rocm-gfx1103 /opt/singverse-audio-rocm-gfx1103
+RUN python -m pip install --no-cache-dir -r requirements-audio-rocm.lock
+# Install gfx1103 in the final stage, after general ROCm, with an isolated venv.
+# A separate stage plus COPY duplicates this large runtime on the runner disk.
+RUN --mount=type=cache,id=singverse-compute-pip,target=/root/.cache/pip,sharing=locked \
+    python -m venv /opt/singverse-audio-rocm-gfx1103 && \
+    /opt/singverse-audio-rocm-gfx1103/bin/python -m pip install -r requirements.lock
+RUN /opt/singverse-audio-rocm-gfx1103/bin/python -m pip install --no-cache-dir --no-build-isolation -r requirements-audio-rocm-native.lock && \
+    /opt/singverse-audio-rocm-gfx1103/bin/python -m pip check
 ENV SINGVERSE_COMPUTE_VARIANT=rocm \
     COMPUTE_AUDIO_ROCM_GFX1103_PYTHON=/opt/singverse-audio-rocm-gfx1103/bin/python \
     HOME=/tmp USER=singverse LOGNAME=singverse
 USER 10001:10001
 
-FROM cpu-fallback AS openvino
+FROM cpu-fallback AS openvino-runtime
 USER root
 ARG TARGETARCH
 RUN test "$TARGETARCH" = amd64
 COPY infra/docker/build/compute/install-opencl.sh /tmp/install-opencl.sh
 RUN sh /tmp/install-opencl.sh && rm /tmp/install-opencl.sh
-RUN --mount=type=cache,target=/root/.cache/pip python -m pip install -r requirements-audio-openvino.lock
+RUN python -m pip install --no-cache-dir -r requirements-audio-openvino.lock
 ENV SINGVERSE_COMPUTE_VARIANT=openvino
 USER 10001:10001
 
-FROM cpu-fallback AS rknn
+FROM cpu-fallback AS rknn-runtime
 USER root
 ARG TARGETARCH
 RUN test "$TARGETARCH" = arm64
-RUN --mount=type=cache,target=/root/.cache/pip python -m pip install -r requirements-audio-uvr.lock -r requirements-audio-rknn.lock
+RUN python -m pip install --no-cache-dir -r requirements-audio-uvr.lock -r requirements-audio-rknn.lock
 ENV SINGVERSE_COMPUTE_VARIANT=rknn
 USER 10001:10001
+
+# Only these small final stages change when application code or Release tags change.
+FROM cuda-runtime AS cuda
+ARG SINGVERSE_VERSION=0.0.0
+ARG SOURCE_REVISION=local
+COPY --from=source /opt/singverse-compute/singverse_compute/ ./singverse_compute/
+LABEL org.opencontainers.image.title="SingVerse Compute" \
+      org.singverse.image.version-source="release-tag" \
+      org.opencontainers.image.version="${SINGVERSE_VERSION}" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}"
+
+FROM rocm-runtime AS rocm
+ARG SINGVERSE_VERSION=0.0.0
+ARG SOURCE_REVISION=local
+COPY --from=source /opt/singverse-compute/singverse_compute/ ./singverse_compute/
+LABEL org.opencontainers.image.title="SingVerse Compute" \
+      org.singverse.image.version-source="release-tag" \
+      org.opencontainers.image.version="${SINGVERSE_VERSION}" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}"
+
+FROM openvino-runtime AS openvino
+ARG SINGVERSE_VERSION=0.0.0
+ARG SOURCE_REVISION=local
+COPY --from=source /opt/singverse-compute/singverse_compute/ ./singverse_compute/
+LABEL org.opencontainers.image.title="SingVerse Compute" \
+      org.singverse.image.version-source="release-tag" \
+      org.opencontainers.image.version="${SINGVERSE_VERSION}" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}"
+
+FROM rknn-runtime AS rknn
+ARG SINGVERSE_VERSION=0.0.0
+ARG SOURCE_REVISION=local
+COPY --from=source /opt/singverse-compute/singverse_compute/ ./singverse_compute/
+LABEL org.opencontainers.image.title="SingVerse Compute" \
+      org.singverse.image.version-source="release-tag" \
+      org.opencontainers.image.version="${SINGVERSE_VERSION}" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}"

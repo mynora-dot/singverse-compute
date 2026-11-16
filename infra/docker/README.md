@@ -8,9 +8,9 @@
 
 单独选择计算镜像版本：COMPUTE_VERSION；COMPUTE_RUNTIME 选择运行库。正式版本由 GitHub Release 标签通过 `SINGVERSE_VERSION` 注入，源码不维护 VERSION 文件；本地源码构建默认 `0.0.0`，可显式设置 `SINGVERSE_VERSION`。
 
-## 三平台发布与项目空间
+## 双仓库发布与项目空间
 
-仅发布正式 GitHub Release 时触发 `singverse-compute-images` 工作流。普通 push/PR、保存草稿及 Pre-release 不发布，也不提供 Run workflow 入口。流程直接构建各运行库的 OCI 产物，将同一内容推送到 GHCR、Docker Hub 和阿里云 ACR；不运行单元测试、lint 或容器运行验收。
+仅发布正式 GitHub Release 时触发 `singverse-compute-images` 工作流。普通 push/PR、保存草稿及 Pre-release 不发布，也不提供 Run workflow 入口。流程直接构建各运行库的 OCI 产物，将同一内容推送到 GHCR 和 Docker Hub；不运行单元测试、lint 或容器运行验收。
 
 Release 标签使用 `vMAJOR.MINOR.PATCH`，例如 `v0.0.2`；Actions 自动注入版本 `0.0.2`，所有架构锁定该标签的提交。不需要手动配置版本 Variable。先把工作流推送到 GitHub，再创建指向新提交的标签和 Release。
 
@@ -18,12 +18,10 @@ Release 标签使用 `vMAJOR.MINOR.PATCH`，例如 `v0.0.2`；Actions 自动注�
 | --- | --- |
 | `GHCR_NAMESPACE`（可选） | GHCR 用户/组织，默认仓库 owner 的小写名称 |
 | `DOCKERHUB_NAMESPACE` | Docker Hub 用户/组织 |
-| `ACR_REGISTRY` | ACR 控制台提供的实际域名，不含协议、路径或末尾斜杠 |
-| `ACR_NAMESPACE` | ACR 实例内的命名空间 |
 
-三个平台空间可不同，填写小写名称。ACR 使用 GitHub runner 可访问的地址；缺失配置不会跳过某个平台。
+两个平台空间可不同，填写小写名称；缺失配置不会跳过某个平台。
 
-在本仓库配置 Secrets：`DOCKERHUB_USERNAME`、`DOCKERHUB_TOKEN`、`ACR_USERNAME`、`ACR_PASSWORD`。GHCR 默认使用工作流 `GITHUB_TOKEN` 和 `github.actor`；也可配置 `GHCR_TOKEN`、`GHCR_USERNAME`。提前创建/授权 Docker Hub、ACR 仓库；跨 GitHub owner/org 推送须配置相应权限。凭据只保存到 Secrets。
+在本仓库配置 Secrets：`DOCKERHUB_USERNAME`、`DOCKERHUB_TOKEN`。GHCR 默认使用工作流 `GITHUB_TOKEN` 和 `github.actor`；也可配置 `GHCR_TOKEN`、`GHCR_USERNAME`。提前创建/授权 Docker Hub 仓库；跨 GitHub owner/org 推送须配置相应权限。凭据只保存到 Secrets。
 
 固定标签不同内容会拒绝覆盖，所有平台的固定版本成功后更新 `latest-<runtime>`。每个镜像仓库针对一个版本只新增以下四个版本标签，并维护四个 `latest` 标签：
 
@@ -46,7 +44,6 @@ Release 标签使用 `vMAJOR.MINOR.PATCH`，例如 `v0.0.2`；Actions 自动注�
 | --- | --- |
 | GHCR | `ghcr.io/<ghcr_namespace>` |
 | Docker Hub | `docker.io/<dockerhub_namespace>` |
-| 阿里云 ACR | `<acr_registry>/<acr_namespace>` |
 
 固定 `COMPUTE_VERSION` 为已发布的数字版本（例如 `0.1.0`，不带 `v`），按硬件设置 `COMPUTE_RUNTIME=cuda|rocm|openvino|rknn`。最终镜像为 `${IMAGE_PREFIX}/singverse-compute:${COMPUTE_VERSION}-${COMPUTE_RUNTIME}`，Docker 按镜像清单检查架构。CPU 仅在已启动的节点内按 `cpuFallback` 策略自动降级，不作为单独的镜像或用户可选 AI 设备。示例版本不保证远端已有产物。
 
@@ -63,6 +60,16 @@ make docker-up
 
 正式发布在 GitHub Release 保存每个运行库和架构的 OCI 归档。逻辑名为 `${runtime}-${arch}.oci.tar`；实际使用 1 GiB 内容寻址分片，最后发布 `.oci.tar.json` 清单，包含整包及每片的长度和 SHA-256，适配 GitHub 单资产大小限制。重试先校验归档长度与摘要并恢复同一内容，再发布到镜像仓库。中断上传的分片可复用，固定内容从不覆盖；查询失败不会被当成缓存缺失。脚本入口：`python3 infra/docker/release-artifact.py restore|save --name cuda-amd64.oci.tar --archive /tmp/image.tar`，需要 GH_TOKEN、GITHUB_REPOSITORY 与 RELEASE_TAG，版本由该 Release 标签决定。
 
-发布任务执行 `python3 infra/docker/release.py publish --from-release`，每次只恢复一个运行库所需的架构归档，完成三个镜像仓库的固定版本索引及其引用的镜像层后清理本地文件，再处理下一个运行库。全部固定版本成功后统一更新 `latest-<runtime>`，避免一次下载全部 CUDA、ROCm 等大归档耗尽 runner 磁盘。不再重复上传 Actions artifacts；Release 分片归档作为重试来源，缺失或损坏即停止发布，不在发布阶段重新构建。
+发布任务执行 `python3 infra/docker/release.py publish --from-release`，每次只恢复一个运行库所需的架构归档，完成两个镜像仓库的固定版本索引及其引用的镜像层后清理本地文件，再处理下一个运行库。全部固定版本成功后统一更新 `latest-<runtime>`，避免一次下载全部 CUDA、ROCm 等大归档耗尽 runner 磁盘。不再重复上传 Actions artifacts；Release 分片归档作为重试来源，缺失或损坏即停止发布，不在发布阶段重新构建。
+
+构建与发布 job 在恢复大归档之前运行 `infra/docker/prepare-runner.sh`，仅在临时 GitHub-hosted Linux runner 上清理不用的 SDK、浏览器和云 CLI，并输出实际释放空间；保留 Python、Node、Git、gh、Docker、Skopeo 与 swap。轻量预检和 Mac 安装包打包任务不做清理，不改分区或合并磁盘。
+
+普通依赖使用 BuildKit pip 缓存挂载，CUDA、ROCm 等加速运行库安装禁用大 wheel 下载缓存。ROCm 通用运行库与 gfx1103 独立虚拟环境顺序安装，避免复制整套运行库产生额外磁盘峰值；两套 AMD 运行库及 CPU 自动降级均保留。源码、版本元数据在四个最终阶段才加入，因此仅改代码或版本不再使 GPU 依赖层失效。
+
+跨版本的构建层缓存存放于 `ghcr.io/<GHCR_NAMESPACE>/singverse-compute-buildcache:<runtime>-<arch>`，使用 registry cache 的 `mode=max`，按运行库和架构隔离。缓存包由现有 GHCR 凭据创建，不需要新增 Actions 参数；已有包需允许本仓库 Actions 读写，跨 owner 的自定义凭据也需覆盖缓存包。缓存不向 Docker Hub 复制，正式 `singverse-compute` 仍每个版本只有 8 个标签。缺失缓存正常构建，缓存导出失败不阻断正式产物，正式产物或归档保存失败仍停止发布。首次构建需要填充缓存；后续依赖层不变时才能复用。
+
+pip 缓存挂载只在当前 BuildKit 中复用，不作为 registry cache 上传；跨 runner 复用的是已安装依赖的构建层。导出 OCI 和远程缓存后清理本地 BuildKit 缓存，再保存 Release 分片。
+
+修改 Dockerfile 或工作流后，需要提交、推送并发布指向新提交的新版本 Release；重跑旧运行仍使用旧版本锁定的源码与工作流，无法应用这些修改。
 
 发布日志逐个显示正在查询或上传的完整镜像标签，直接输出 Skopeo 的镜像层进度，并每 30 秒报告仍在上传的目标与耗时。远端标签查询限时 2 分钟；每次复制限时 30 分钟，期间由 Skopeo 最多重试 2 次。超时或失败会停止发布，固定标签全部成功前不会更新 `latest`。发布 job 总限时 120 分钟。重跑同一 Release 会复用已有的相同摘要标签与归档。

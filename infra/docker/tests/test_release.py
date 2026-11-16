@@ -19,31 +19,29 @@ spec.loader.exec_module(release)
 class ReleaseTests(unittest.TestCase):
     def env(self):
         return dict(RELEASE_TAG='v1.2.3', GITHUB_REPOSITORY_OWNER='mynora-dot',
-                    DOCKERHUB_NAMESPACE='custom-hub', ACR_REGISTRY='registry.example.com', ACR_NAMESPACE='custom-acr',
-                    GHCR_TOKEN='test', DOCKERHUB_USERNAME='test', DOCKERHUB_TOKEN='test',
-                    ACR_USERNAME='test', ACR_PASSWORD='test')
+                    DOCKERHUB_NAMESPACE='custom-hub',
+                    GHCR_TOKEN='test', DOCKERHUB_USERNAME='test', DOCKERHUB_TOKEN='test')
 
     def test_namespaces_are_independent_configuration(self):
         env = self.env()
         version, prefixes = release.config(env)
         self.assertEqual(version, '1.2.3')
-        self.assertEqual(prefixes, ['ghcr.io/mynora-dot', 'docker.io/custom-hub', 'registry.example.com/custom-acr'])
+        self.assertEqual(prefixes, ['ghcr.io/mynora-dot', 'docker.io/custom-hub'])
         env['GITHUB_REPOSITORY_OWNER'] = 'MyNora-Dot'
         self.assertEqual(release.config(env)[1][0], 'ghcr.io/mynora-dot')
         env['GHCR_NAMESPACE'] = 'custom-ghcr'
         self.assertEqual(release.config(env)[1][0], 'ghcr.io/custom-ghcr')
 
     def test_missing_destination_or_secret_fails_before_publishing(self):
-        for key in ('DOCKERHUB_NAMESPACE', 'ACR_REGISTRY', 'ACR_NAMESPACE', 'GHCR_TOKEN',
-                    'DOCKERHUB_USERNAME', 'DOCKERHUB_TOKEN', 'ACR_USERNAME', 'ACR_PASSWORD'):
+        for key in ('DOCKERHUB_NAMESPACE', 'GHCR_TOKEN', 'DOCKERHUB_USERNAME', 'DOCKERHUB_TOKEN'):
             env = self.env()
             del env[key]
             with self.subTest(key=key), self.assertRaises(ValueError):
                 release.config(env)
 
     def test_release_tag_and_registry_validation(self):
-        for key, value in [('RELEASE_TAG', 'v9.0.0-rc.1'), ('ACR_REGISTRY', 'https://registry.example.com'),
-                           ('DOCKERHUB_NAMESPACE', 'UpperCase'), ('ACR_NAMESPACE', 'a/b')]:
+        for key, value in [('RELEASE_TAG', 'v9.0.0-rc.1'), ('GHCR_NAMESPACE', 'a/b'),
+                           ('DOCKERHUB_NAMESPACE', 'UpperCase')]:
             env = self.env()
             env[key] = value
             with self.subTest(key=key), self.assertRaises(ValueError):
@@ -75,7 +73,7 @@ class ReleaseTests(unittest.TestCase):
         calls = []
         def ensure(ref, digest, publish):
             calls.append(ref)
-            if ref.startswith('registry.example.com/'):
+            if ref.startswith('docker.io/'):
                 raise RuntimeError('destination unavailable')
         with patch.dict(release.os.environ, self.env(), clear=True), patch.object(release, 'VARIANTS', {'cuda': ['amd64']}), \
              patch.object(release.subprocess, 'check_output', return_value=raw), patch.object(release, 'layout'), \
@@ -97,10 +95,10 @@ class ReleaseTests(unittest.TestCase):
              patch.object(release.subprocess, 'check_output', return_value=raw), patch.object(release, 'ensure', side_effect=ensure), \
              patch.object(release, 'layout'), patch.object(release, 'copy_image', side_effect=copy):
             release.publish(Path('/unused'))
-        self.assertEqual([event[0] for event in events], ['fixed'] * 3 + ['latest'] * 3)
-        self.assertEqual(len({event[2] for event in events[:3]}), 1)
-        self.assertTrue(all(event[1].startswith('docker://') for event in events[-3:]))
-        self.assertEqual(len({event[1] for event in events[-3:]}), 3)
+        self.assertEqual([event[0] for event in events], ['fixed'] * 2 + ['latest'] * 2)
+        self.assertEqual(len({event[2] for event in events[:2]}), 1)
+        self.assertTrue(all(event[1].startswith('docker://') for event in events[-2:]))
+        self.assertEqual(len({event[1] for event in events[-2:]}), 2)
 
     def test_version_index_failure_does_not_update_latest(self):
         raw = json.dumps({'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.manifest.v1+json'}).encode()
@@ -150,7 +148,7 @@ class ReleaseTests(unittest.TestCase):
 
         self.assertEqual(restored, ['cuda-amd64', 'cuda-arm64', 'rocm-amd64'])
         self.assertEqual(len(roots), 2)
-        self.assertEqual([event[0] for event in events], ['fixed'] * 6 + ['latest'] * 6)
+        self.assertEqual([event[0] for event in events], ['fixed'] * 4 + ['latest'] * 4)
         self.assertTrue(all(not root.exists() for root in roots))
 
     def test_missing_release_archive_stops_publishing_and_cleans_downloads(self):
@@ -305,9 +303,9 @@ class ReleaseTests(unittest.TestCase):
                  patch.object(release, 'remote_digest', side_effect=digest), \
                  patch.object(release, 'copy_image', side_effect=copy):
                 release.publish(directory)
-                self.assertEqual(len(copies), 24)
-                self.assertTrue(all(':latest-' not in ref for ref in copies[:12]))
-                self.assertTrue(all(':latest-' in ref for ref in copies[12:]))
+                self.assertEqual(len(copies), 16)
+                self.assertTrue(all(':latest-' not in ref for ref in copies[:8]))
+                self.assertTrue(all(':latest-' in ref for ref in copies[8:]))
                 expected = {f'{version}-{runtime}' for version in ('1.2.3', 'latest')
                             for runtime in ('cuda', 'rocm', 'openvino', 'rknn')}
                 for prefix in release.config(self.env())[1]:
@@ -318,7 +316,7 @@ class ReleaseTests(unittest.TestCase):
                         self.assertEqual(fixed, registries[f'{prefix}/singverse-compute:latest-{runtime}'])
                         self.assertEqual(json.loads(fixed)['manifests'][0]['platform'], {'os': 'linux', 'architecture': arch})
                 release.publish(directory)
-                self.assertEqual(len(copies), 36, 'Retries reuse all immutable tags and only refresh latest')
+                self.assertEqual(len(copies), 24, 'Retries reuse all immutable tags and only refresh latest')
 
 
 if __name__ == '__main__':

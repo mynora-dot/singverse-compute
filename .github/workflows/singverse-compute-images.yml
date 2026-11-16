@@ -33,13 +33,9 @@ jobs:
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
           GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE }}
           DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
-          ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
-          ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE }}
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
-          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
         run: python3 infra/docker/release.py validate
   macos:
     if: needs.preflight.outputs.publish == 'true'
@@ -63,11 +59,13 @@ jobs:
     needs: preflight
     permissions:
       contents: write
+      packages: write
     env:
       GH_TOKEN: ${{ github.token }}
       SOURCE_REVISION: ${{ needs.preflight.outputs.revision }}
       SINGVERSE_VERSION: ${{ needs.preflight.outputs.version }}
       RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+      GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE }}
     strategy:
       fail-fast: false
       matrix:
@@ -79,16 +77,22 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
-      - name: Make room for accelerator runtimes and OCI exports
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.preflight.outputs.revision }}
-      - uses: docker/setup-buildx-action@v3
-      - name: Restore release archive for retries
+      - name: Make room for accelerator runtimes and OCI exports
+        run: bash infra/docker/prepare-runner.sh
+      - name: Restore the immutable release archive for retries
         id: cached
-        if: needs.preflight.outputs.publish == 'true'
         run: python3 infra/docker/release-artifact.py restore --name '${{ matrix.variant }}-${{ matrix.arch }}.oci.tar'
+      - uses: docker/setup-buildx-action@v3
+        if: steps.cached.outputs.found != 'true'
+      - name: Authenticate the shared build cache
+        if: steps.cached.outputs.found != 'true'
+        env:
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USERNAME" --password-stdin
       - name: Build runtime release archive
         if: steps.cached.outputs.found != 'true'
         env:
@@ -97,17 +101,24 @@ jobs:
         run: |
           file=infra/docker/build/compute.Dockerfile
           target="$VARIANT"
+          namespace="${GHCR_NAMESPACE:-${GITHUB_REPOSITORY_OWNER,,}}"
+          cache="ghcr.io/$namespace/singverse-compute-buildcache:$VARIANT-$ARCH"
           docker buildx build --file "$file" --target "$target" --platform "linux/$ARCH" \
             --build-arg "SOURCE_REVISION=$SOURCE_REVISION" \
             --build-arg "SINGVERSE_VERSION=$SINGVERSE_VERSION" \
-            --provenance=false --tag singverse:check \
+            --cache-from "type=registry,ref=$cache" \
+            --cache-to "type=registry,ref=$cache,mode=max,ignore-error=true" \
+            --progress=plain --provenance=false --tag singverse:check \
             --output type=oci,dest=/tmp/image.tar .
       - name: Release build cache after exporting the archive
         if: steps.cached.outputs.found != 'true'
-        run: docker buildx prune --all --force
+        run: |
+          docker buildx prune --all --force
+          df -h /
       - name: Preserve release archive for publish retries
         if: needs.preflight.outputs.publish == 'true' && steps.cached.outputs.found != 'true'
         run: python3 infra/docker/release-artifact.py save --name '${{ matrix.variant }}-${{ matrix.arch }}.oci.tar'
+
   publish:
     if: needs.preflight.outputs.publish == 'true'
     needs: [preflight, build]
@@ -122,25 +133,25 @@ jobs:
       SINGVERSE_VERSION: ${{ needs.preflight.outputs.version }}
       GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE }}
       DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
-      ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
-      ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE }}
       GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
       GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-      ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
-      ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
     steps:
-      - name: Make room for accelerator release archives
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.preflight.outputs.revision }}
-      - run: sudo apt-get update && sudo apt-get install -y skopeo
+      - name: Make room for accelerator release archives
+        run: bash infra/docker/prepare-runner.sh
+      - name: Use the preinstalled registry copy tool
+        run: |
+          if ! command -v skopeo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends skopeo
+          fi
       - name: Authenticate all destinations without printing credentials
         run: |
           printf '%s' "$GHCR_TOKEN" | skopeo login ghcr.io --username "$GHCR_USERNAME" --password-stdin
           printf '%s' "$DOCKERHUB_TOKEN" | skopeo login docker.io --username "$DOCKERHUB_USERNAME" --password-stdin
-          printf '%s' "$ACR_PASSWORD" | skopeo login "$ACR_REGISTRY" --username "$ACR_USERNAME" --password-stdin
       - name: Publish identical immutable artifacts, then update latest
         run: python3 -u infra/docker/release.py publish --from-release
