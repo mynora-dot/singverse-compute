@@ -248,7 +248,7 @@ class AudioModels:
                 present = self.model_valid(RKNN)
                 runtime = environment.get('versions', {}).get('rknn-toolkit-lite2') == '2.3.2' and getattr(self.audio, 'dependencies_available', False)
                 if device and runtime:
-                    item.update(state='UNVERIFIED' if present else 'MODEL_MISSING', reason='请运行NPU模型试跑' if present else '请离线部署UVR MDXNET 9482转换模型及manifest.json')
+                    item.update(state='UNVERIFIED' if present else 'MODEL_MISSING', reason='请运行NPU模型试跑' if present else '请在模型管理中下载或导入匹配芯片的 RKNN 模型 ZIP')
                     record = self.qualified.get(backend, {})
                     if present and record.get('environment') == environment['fingerprint'] and record.get('digest') == self.inference_digest(RKNN):
                         item.update(state=record['state'], reason=record.get('reason', ''), elapsedMs=record.get('elapsedMs'))
@@ -367,6 +367,10 @@ class AudioModels:
 
     def model_status(self, model_id):
         value = deepcopy(manifest(model_id))
+        if model_id == RKNN:
+            from ..infrastructure.hardware import device_tree
+            compatible = device_tree('compatible').lower()
+            value['target'] = next((chip for chip in ('rk3566', 'rk3568', 'rk3588') if chip in compatible), None)
         value.update(installed=self.model_valid(model_id), writable=self.model_writable(model_id))
         return value
 
@@ -486,15 +490,20 @@ class AudioModels:
             if destination.exists() and any(destination.iterdir()):
                 if not self.model_valid(model_id):
                     raise ComputeError(409, 'Existing model directory differs; preserve or move it before installation')
+                if model_id == RKNN:
+                    from ..infrastructure.rknn_audio import local_manifest
+                    if self.inference_digest(RKNN) != local_manifest(stage)[1]:
+                        raise ComputeError(409, '已有 RKNN 模型与导入内容不同，请先备份并移走已有目录')
             else:
                 stage.replace(destination)
             self._manifest_cache = {}
+            self._rknn_stamp = None
             self.operation.update(state='SUCCEEDED')
             self.persist()
 
     def import_bundle(self, archive, stage, model_id):
-        if manifest(model_id).get('localOnly'):
-            raise ComputeError(422, 'RKNN模型仅支持节点本地部署')
+        if model_id == RKNN:
+            return self.import_rknn_bundle(archive, stage)
         files = manifest(model_id)['files']
         try:
             with zipfile.ZipFile(archive) as bundle:
@@ -511,10 +520,74 @@ class AudioModels:
         except (zipfile.BadZipFile, RuntimeError, OSError) as error:
             raise ComputeError(422, 'Invalid model ZIP bundle') from error
 
-    def download(self, model_id=BASELINE):
+    def import_rknn_bundle(self, archive, stage):
+        from ..infrastructure.hardware import device_tree
+        from ..infrastructure.rknn_audio import local_manifest
+        compatible = device_tree('compatible').lower()
+        chip = next((target for target in ('rk3566', 'rk3568', 'rk3588') if target in compatible), None)
+        if not chip:
+            raise ComputeError(422, '无法识别 RKNN 芯片，请检查计算容器的设备树挂载')
+        maximum = manifest(RKNN)['maxBytes']
+        try:
+            with zipfile.ZipFile(archive) as bundle:
+                entries = bundle.infolist()
+                names = [item.filename for item in entries]
+                targets = ('rk3566', 'rk3568', 'rk3588')
+                if not entries or len(entries) > 9 or len(names) != len(set(names)):
+                    raise ComputeError(422, 'RKNN ZIP 包含重复文件或文件数量不正确')
+                files = {item.filename: item for item in entries if not item.is_dir()}
+                required = {'manifest.json', 'uvr.rknn'}
+                if set(files) == required:
+                    prefix = ''
+                    expected = required
+                    directories = set()
+                else:
+                    present = {target for target in targets if any(name.startswith(target + '/') for name in files)}
+                    expected = {target + '/' + name for target in present for name in required}
+                    directories = {target + '/' for target in present}
+                    prefix = chip + '/'
+                    if not present or set(files) != expected or chip not in present:
+                        raise ComputeError(422, 'RKNN ZIP 须包含 manifest.json、uvr.rknn，或当前芯片对应的完整目录')
+                if any(item.is_dir() and item.filename not in directories for item in entries):
+                    raise ComputeError(422, 'RKNN ZIP 包含额外目录')
+                if sum(item.file_size for item in files.values()) > maximum:
+                    raise ComputeError(413, 'RKNN ZIP 解压后超过大小限制')
+                for item in entries:
+                    mode = (item.external_attr >> 16) & 0o170000
+                    if (item.orig_filename != item.filename or item.flag_bits & 1
+                            or mode not in (0, 0o040000 if item.is_dir() else 0o100000)):
+                        raise ComputeError(422, 'RKNN ZIP 不接受加密文件、符号链接或特殊文件')
+                for name in expected:
+                    item = files[name]
+                    limit = 65536 if name.endswith('manifest.json') else maximum
+                    if not 0 < item.file_size <= limit:
+                        raise ComputeError(413, 'RKNN 模型文件为空或超过大小限制')
+                for name in required:
+                    item = files[prefix + name]
+                    with bundle.open(item) as stream, (stage / name).open('wb') as target:
+                        copied = 0
+                        while block := stream.read(1024**2):
+                            if self.cancel.is_set():
+                                raise ComputeError(409, '模型导入已取消')
+                            copied += len(block)
+                            if copied > item.file_size:
+                                raise ComputeError(413, 'RKNN 模型文件超过声明的大小')
+                            target.write(block)
+                            self.operation['bytes'] += len(block)
+                metadata, _ = local_manifest(stage)
+                if metadata['target'] != chip:
+                    raise ComputeError(422, 'RKNN 模型芯片不匹配，当前节点为 ' + chip)
+            self.finish_bundle(stage, RKNN)
+        except (zipfile.BadZipFile, RuntimeError, OSError, ValueError, TypeError, KeyError) as error:
+            raise ComputeError(422, 'RKNN 模型包无效，请检查源模型、工具链版本、文件大小和 SHA-256') from error
+
+    def download(self, model_id=BASELINE, source=None):
         specification = manifest(model_id)
-        if specification.get('localOnly'):
-            raise ComputeError(422, 'RKNN模型仅支持管理员在节点本地部署，见RKNN部署说明')
+        if model_id == RKNN:
+            from ..infrastructure.model_download import download_source
+            source = download_source(source)
+        elif source:
+            raise ComputeError(422, '此模型仅使用固定清单中的下载地址')
         if not (self.writable() if model_id == BASELINE else self.model_writable(model_id)):
             raise ComputeError(409, 'Model directory is missing or read only')
         self.begin('DOWNLOADING', model_id)
@@ -522,7 +595,16 @@ class AudioModels:
             try:
                 with self.stage() as temporary:
                     stage = Path(temporary)
-                    if model_id == BASELINE:
+                    if model_id == RKNN:
+                        from ..infrastructure.model_download import download_bundle
+                        archive = stage / 'download.zip'
+                        download_bundle(source, archive, specification['maxBytes'], self.cancel,
+                                        lambda size: self.operation.update(bytes=size))
+                        bundle = stage / 'bundle'
+                        bundle.mkdir()
+                        self.operation['bytes'] = 0
+                        self.import_bundle(archive, bundle, RKNN)
+                    elif model_id == BASELINE:
                         with urlopen(URL, timeout=20) as response:
                             self.install(response, stage)
                     else:

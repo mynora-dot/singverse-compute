@@ -38,7 +38,7 @@ class AudioModelHttpTest(unittest.TestCase):
 
     def request(self, suffix='', data=None, authenticated=True):
         headers = {'Authorization': 'Bearer '+'m'*64} if authenticated else {}
-        headers['Content-Type'] = 'application/octet-stream' if suffix == '/import' else 'application/json'
+        headers['Content-Type'] = 'application/octet-stream' if suffix.split('?')[0] == '/import' else 'application/json'
         return urlopen(Request(self.base+suffix, headers=headers, data=data), timeout=10)
 
     def test_model_operations_require_internal_auth(self):
@@ -88,3 +88,37 @@ class AudioModelHttpTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as caught:
             self.request('/import?model=unknown', b'body')
         self.assertEqual(caught.exception.code, 400); caught.exception.close()
+
+    def test_rknn_import_and_download_use_the_authenticated_streaming_api(self):
+        import hashlib
+        from tests.unit.test_rknn_models import archive, model_files
+        manager = self.app.state.audio_roles.models
+        data = archive(model_files()).getvalue()
+        with patch('singverse_compute.infrastructure.hardware.device_tree', return_value='rockchip,rk3566\0'):
+            with self.request('/import?model=uvr-mdxnet-9482-rknn', data) as response:
+                self.assertEqual(json.load(response)['state'], 'SUCCEEDED')
+            with self.request() as response:
+                status = json.load(response)
+            model = next(value for value in status['models'] if value['id'] == 'uvr-mdxnet-9482-rknn')
+            self.assertTrue(model['installed'])
+            self.assertEqual(model['target'], 'rk3566')
+            self.assertIsNone(status['selected'])
+            with self.assertRaises(HTTPError) as caught:
+                self.request('/import?model=uvr-mdxnet-9482-rknn', archive(model_files('rk3588')).getvalue())
+            self.assertEqual(caught.exception.code, 422)
+            self.assertIn('芯片不匹配', json.load(caught.exception)['title'])
+            caught.exception.close()
+            self.assertTrue(manager.model_valid('uvr-mdxnet-9482-rknn'))
+            def fetch(source, destination, maximum, cancel, progress):
+                destination.write_bytes(data)
+                progress(len(data))
+            source = {'url': 'https://models.example.test/rk.zip', 'sha256': hashlib.sha256(data).hexdigest()}
+            with patch('singverse_compute.infrastructure.model_download.download_bundle', side_effect=fetch):
+                with self.request('/download?model=uvr-mdxnet-9482-rknn', json.dumps(source).encode()) as response:
+                    self.assertEqual(response.status, 202)
+                manager.thread.join(5)
+            self.assertEqual(manager.operation['state'], 'SUCCEEDED')
+            with self.assertRaises(HTTPError) as caught:
+                self.request('/download?model=uvr-mdxnet-9482-rknn', b'{}')
+            self.assertEqual(caught.exception.code, 422)
+            caught.exception.close()

@@ -42,9 +42,15 @@ class Backend(BaseModel):
     separationProfile: Literal['AI_CLEAN', 'LEGACY_DEMUCS'] | None = None
 
 
+class ModelDownload(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    url: str | None = Field(default=None, max_length=4096)
+    sha256: str | None = Field(default=None, pattern=r'^[0-9a-fA-F]{64}$')
+
+
 @router.post('/models/download', status_code=202)
-def download(request: Request, model: str = BASELINE):
-    return request.app.state.audio_roles.models.download(model)
+def download(request: Request, model: str = BASELINE, body: ModelDownload | None = None):
+    return request.app.state.audio_roles.models.download(model, body.model_dump(exclude_none=True) if body else None)
 
 
 @router.post('/models/cancel')

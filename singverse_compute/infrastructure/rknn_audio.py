@@ -3,16 +3,24 @@ import argparse
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 
 
 def local_manifest(directory):
     directory = Path(directory)
-    data = json.loads((directory / 'manifest.json').read_text())
+    document = directory / 'manifest.json'
+    if document.stat().st_size > 65536:
+        raise ValueError('RKNN manifest exceeds size limit')
+    data = json.loads(document.read_text())
+    if not isinstance(data, dict):
+        raise ValueError('RKNN manifest must be an object')
     if data.get('profile') != 'uvr-mdxnet-9482-v1' or data.get('target') not in ('rk3588', 'rk3566', 'rk3568'):
         raise ValueError('Unsupported RKNN forward profile or target')
     if data.get('sourceSha256') != '9d78f8566fa8198065214ab628be1de966a500c57786695aa4b13e2b27a7727d' or data.get('toolkit') != '2.3.2':
         raise ValueError('Unexpected RKNN source model or toolkit')
+    if type(data.get('size')) is not int or not isinstance(data.get('sha256'), str) or not re.fullmatch(r'[0-9a-f]{64}', data['sha256']):
+        raise ValueError('Invalid RKNN model size or digest')
     model = directory / 'uvr.rknn'
     size = model.stat().st_size
     if not 0 < size <= 512 * 1024**2 or size != data['size']:

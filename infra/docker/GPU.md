@@ -27,7 +27,7 @@ COMPUTE_RUNTIME=cuda \
 
 源码路线在基础配置后增加 `-f infra/docker/compose/compose.compute-build.yaml`，使用 `--build --pull missing`。AMD 设置 `COMPUTE_RENDER_GID` 和 `COMPUTE_VIDEO_GID`；DRI 设置 `COMPUTE_RENDER_GID`，通过 `COMPUTE_HARDWARE_DEVICE` 选择宿主 render 设备。视频后端可用 `COMPUTE_HARDWARE_BACKEND` 显式选择，默认 auto，不代表已经合格。
 
-RKNN 需设置 `RKNPU_CARD_GID`、`RKNPU_GID`、`RKNN_MODEL_PATH`，必要时设置设备路径及 `RKNN_RUNTIME_LIBRARY`。模型目录必须已经存在，宿主提供兼容 `librknnrt.so`；转换和真机验证按 compute 模块说明执行，不把模型打入公共镜像。
+RKNN 需设置 `RKNPU_CARD_GID`、`RKNPU_GID`，必要时设置设备路径及 `RKNN_RUNTIME_LIBRARY`。宿主提供兼容 `librknnrt.so`。通过管理平台下载或导入时，应为父模型目录提供可写持久化挂载，并省略 `compose.rknn.yaml` 中单独的只读模型挂载；该旧预置方式仍需 `RKNN_MODEL_PATH` 指向已有转换目录。RKNN ZIP 支持单芯片或按 rk3566/rk3568/rk3588 分目录的多芯片模型，在线下载需填写公网 HTTPS 地址和完整包 SHA-256。转换和真机验证按 compute 模块说明执行，不把模型打入公共运行镜像。
 
 ## 独立计算节点
 

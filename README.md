@@ -376,14 +376,26 @@ python scripts/convert-rknn-audio.py \
   --target rk3566 --output /absolute/path/to/uvr-mdxnet-9482-rknn
 ```
 
-脚本先校验固定 ONNX 摘要，再将动态 batch 固定为 1，按 `[1,4,2048,256]` 转换；不量化。不支持的算子或构建失败会明确失败，不生成可部署 manifest。输出目录须不存在；成功输出 `uvr.rknn` 和 `manifest.json`。RK3566 的转换、容器限制及板端结果见 [实测记录](VERIFICATION.rk3566-2026-11-08.md)；其他设备仍须自行转换并验证，不能把脚本存在视作 NPU 已可用。
+脚本先校验固定 ONNX 摘要，再将动态 batch 固定为 1，按 `[1,4,2048,256]` 转换；不量化。不支持的算子或构建失败会明确失败，不生成可部署 manifest。输出目录须不存在；成功输出 `uvr.rknn` 和 `manifest.json`。本轮已完成 RK3566、RK3568、RK3588 的转换和通用包导入验证，见 [模型包验证记录](VERIFICATION.rknn-models-2026-11-20.md)。RK3566 的既有容器限制及板端结果见 [实测记录](VERIFICATION.rk3566-2026-11-08.md)；各芯片本轮模型仍须在目标设备试跑，不能把转换成功视作 NPU 已可用。
+
+管理平台支持 RKNN ZIP 离线导入，以及填写公网 HTTPS ZIP 地址和完整包 SHA-256 后下载。无需在部署主机安装转换工具或新增环境变量。单芯片 ZIP 根目录必须恰好包含 `manifest.json`、`uvr.rknn`；多芯片 ZIP 将这两个文件分别放在 `rk3566/`、`rk3568/`、`rk3588/` 中，平台根据设备树自动选择当前芯片。包大小及总解压大小均限 512MiB，不接受额外文件、重复成员、加密、符号链接或路径穿越。安装检查固定源模型、工具链 2.3.2、板型、大小与摘要；不会覆盖不同内容的已有模型，也不会自动取得推理资格。模型目录继续使用 `./singverse-audio-models:/var/lib/singverse-models` 持久化，容器需能读取设备树。普通 RKNN 模型不能直接作为本应用的分离模型导入，必须遵循上述 UVR 转换约定。
+
+转换后使用打包脚本生成可导入 ZIP 及 `.sha256` 文件，支持单个或多个转换输出目录；脚本不会覆盖已有包：
+
+```sh
+python scripts/package-rknn-audio.py \
+  /absolute/path/to/rk3566 /absolute/path/to/rk3568 /absolute/path/to/rk3588 \
+  --output /absolute/path/to/uvr-mdxnet-9482-rk.zip
+```
+
+当前不预填不存在的公共模型地址。部署者可离线导入转换包，或将包放在自己的公网 HTTPS 文件服务并在管理页面填写地址与 `.sha256` 中的摘要；来源仅用于当次下载，不写入节点设置，不携带内部凭据，重定向也检查公网 HTTPS 地址。
 
 板端原生部署步骤：
 
 1. fnOS 所用内核必须提供与 RKNN Lite2 2.3.2 匹配的 RKNPU 驱动及 `librknnrt.so`；服务用户应有 NPU 设备权限。没有驱动时仅复制 Python 包不能启用 NPU。具体设备及固件仍须逐台验证；已检查的 RK3566/fnOS 环境见 [实测记录](VERIFICATION.rk3566-2026-11-08.md)。
 2. 执行 `make compute-setup compute-audio-rknn-setup`，将上述转换目录放到 `COMPUTE_AUDIO_MODEL_REPO` 同级的 `uvr-mdxnet-9482-rknn/`，避免运行时替换。旧 `htdemucs-rknn/` 不再读取，旧试跑资格自动失效。
 3. Docker 中将主机 `/sys/firmware/devicetree/base` 只读挂到 `/run/singverse-hardware/device-tree`（模板已包含），供板型与模型目标校验；Docker 默认可能屏蔽容器内 `/sys/firmware`，不要将目标仍设在那里。识别同时读取 `model` 和 `compatible`，支持 OEC 等产品名。沿用现有 compute 认证与缓存配置启动节点，媒体使用任务回源；默认音频预算 4GiB，内存不足会阻止任务。可选 Dockerfile `rknn` 构建阶段及设备映射配置见硬件指南，不使用特权容器。
-4. 刷新管理端节点，RKNN 模型应显示 `UNVERIFIED`，执行试跑后才能选择。试跑校验约 8 秒输出的时间轴与非静音，不能替代真实歌曲音质验收。网络下载和网页导入 RKNN 模型仍不支持。
+4. 也可直接在管理平台下载或导入 RKNN ZIP，安装后刷新节点。RKNN 模型应显示 `UNVERIFIED`，执行试跑后才能选择。试跑校验约 8 秒输出的时间轴与非静音，不能替代真实歌曲音质验收。
 5. 首次真机测试关闭 CPU 自动降级，确认结果实际后端为 `rknn`、模型为 `uvr-mdxnet-9482-rknn`；对比 ONNX 基准的人声残留、乐器损失、声道及起止对齐，记录全曲耗时、内存峰值与模型摘要。随后测试取消、重启、实时播放抢占和 CPU 降级；降级仍需安装 Demucs 基准模型并完成 CPU 试跑。
 
 本次 RK3566 已完成转换、隔离 NPU 全曲及首块 CPU 数值对照，见 [实测记录](VERIFICATION.rk3566-2026-11-08.md)；正式服务接入、主观音质和其他 BSP/设备仍须分别验证。

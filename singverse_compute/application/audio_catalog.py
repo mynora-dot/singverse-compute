@@ -1,4 +1,4 @@
-"""Release-owned model manifests. Request bodies never supply URLs or digests."""
+"""Pinned built-in models and the validated, chip-specific RKNN bundle format."""
 import hashlib
 import json
 
@@ -22,7 +22,8 @@ MODELS = {
         'id': RKNN, 'version': '9482-local-v1', 'format': 'rknn', 'license': 'See upstream UVR model terms',
         'backends': ['rknn'], 'sampleRate': 44100,
         'sources': ['vocals', 'no_vocals'],
-        'maxBytes': 512 * 1024**2, 'files': [], 'localOnly': True,
+        'maxBytes': 512 * 1024**2, 'files': [],
+        'importFiles': ['manifest.json', 'uvr.rknn'], 'downloadSourceRequired': True,
     },
     FAST: {
         'id': FAST, 'version': 'audioset-0.343', 'format': 'pytorch', 'license': 'CC-BY-4.0',
