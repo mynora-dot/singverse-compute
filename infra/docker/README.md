@@ -34,7 +34,7 @@ Release 标签使用 `vMAJOR.MINOR.PATCH`，例如 `v0.0.2`；Actions 自动注�
 
 不再发布 `base`、`cpu`、`uvr`、`rocm-native` 或带 `-amd64` / `-arm64` 的额外标签。架构信息保存在镜像清单中，子清单通过 digest 引用。历史版本标签继续保留，因此长期总数会随版本累积；本次修改不会删除仓库中已有的旧标签。
 
-重试使用同一 Release 的已有归档；修复代码后需使用指向新提交的新版本，重跑旧 Actions 不会加载新代码。运行库镜像不内置模型权重。同一工作流另将 Mac ARM64 安装归档和 SHA-256 文件上传到该 Release，首次安装在 Mac 下载锁定依赖，无需新增凭据。
+重试使用同一版本及提交对应的 GHCR 镜像缓存；修复代码后需使用指向新提交的新版本，重跑旧 Actions 不会加载新代码。运行库镜像不内置模型权重。同一工作流使用 macOS runner 将 Mac ARM64 DMG 和 SHA-256 文件上传到该 Release，首次安装在 Mac 下载锁定依赖，无需新增凭据。Docker 镜像及中间文件不作为 Release 附件。
 
 ## 从指定仓库部署
 
@@ -56,11 +56,11 @@ make docker-up
 
 切换仓库前确认同一固定版本的 digest 一致，只改 `IMAGE_PREFIX`，保留 `singverse-compute-node` 项目名和现有卷。Go 仓库的同机组合部署共用一个前缀，发布主服务和 compute 时应选择对应平台的同一空间；独立节点可以使用自己的空间。计算认证、硬件/模型设置和媒体目录按原配置保留。
 
-## 可恢复的发布归档
+## 可恢复的镜像发布缓存
 
-正式发布在 GitHub Release 保存每个运行库和架构的 OCI 归档。逻辑名为 `${runtime}-${arch}.oci.tar`；实际使用 1 GiB 内容寻址分片，最后发布 `.oci.tar.json` 清单，包含整包及每片的长度和 SHA-256，适配 GitHub 单资产大小限制。重试先校验归档长度与摘要并恢复同一内容，再发布到镜像仓库。中断上传的分片可复用，固定内容从不覆盖；查询失败不会被当成缓存缺失。脚本入口：`python3 infra/docker/release-artifact.py restore|save --name cuda-amd64.oci.tar --archive /tmp/image.tar`，需要 GH_TOKEN、GITHUB_REPOSITORY 与 RELEASE_TAG，版本由该 Release 标签决定。
+正式发布把每个运行库和架构的镜像缓存到 `ghcr.io/<GHCR_NAMESPACE>/singverse-compute-buildcache:release-<版本>-<完整提交>-<runtime>-<arch>`，不上传 OCI 归档、分片或清单到 GitHub Release。缓存标识同时锁定版本、提交、运行库和架构，已有内容不同则拒绝覆盖。恢复时按不可变摘要下载并核对 OCI 清单摘要；鉴权或网络错误不会被当成缓存缺失。脚本入口：`python3 infra/docker/release-artifact.py restore|save --name cuda-amd64.oci.tar --archive /tmp/image.tar`，需要 `GITHUB_REPOSITORY`、`RELEASE_TAG`、`SOURCE_REVISION` 和已登录的 GHCR 凭据，版本由该 Release 标签决定。重试不受 Actions artifacts 的保留期限限制。
 
-发布任务执行 `python3 infra/docker/release.py publish --from-release`，每次只恢复一个运行库所需的架构归档，完成两个镜像仓库的固定版本索引及其引用的镜像层后清理本地文件，再处理下一个运行库。全部固定版本成功后统一更新 `latest-<runtime>`，避免一次下载全部 CUDA、ROCm 等大归档耗尽 runner 磁盘。不再重复上传 Actions artifacts；Release 分片归档作为重试来源，缺失或损坏即停止发布，不在发布阶段重新构建。
+发布任务执行 `python3 infra/docker/release.py publish --from-registry`，每次只恢复一个运行库所需的架构归档，完成两个镜像仓库的固定版本索引及其引用的镜像层后清理本地文件，再处理下一个运行库。全部固定版本成功后统一更新 `latest-<runtime>`，避免一次下载全部 CUDA、ROCm 等大归档耗尽 runner 磁盘。GHCR 缓存作为跨 job 和重试来源，缺失或损坏即停止发布，不在发布阶段重新构建。
 
 构建与发布 job 在恢复大归档之前运行 `infra/docker/prepare-runner.sh`，仅在临时 GitHub-hosted Linux runner 上清理不用的 SDK、浏览器和云 CLI，并输出实际释放空间；保留 Python、Node、Git、gh、Docker、Skopeo 与 swap。轻量预检和 Mac 安装包打包任务不做清理，不改分区或合并磁盘。
 
@@ -72,8 +72,8 @@ ROCm 移除旧的 PyTorch 2.5.1 / ROCm 6.2 栈及额外 gfx1103 GPU 虚拟环境
 
 跨版本的构建层缓存存放于 `ghcr.io/<GHCR_NAMESPACE>/singverse-compute-buildcache:<runtime>-<arch>`，使用 registry cache 的 `mode=max`，按运行库和架构隔离。缓存包由现有 GHCR 凭据创建，不需要新增 Actions 参数；已有包需允许本仓库 Actions 读写，跨 owner 的自定义凭据也需覆盖缓存包。缓存不向 Docker Hub 复制，正式 `singverse-compute` 仍每个版本只有 8 个标签。缺失缓存正常构建，缓存导出失败不阻断正式产物，正式产物或归档保存失败仍停止发布。首次构建需要填充缓存；后续依赖层不变时才能复用。
 
-pip 缓存挂载只在当前 BuildKit 中复用，不作为 registry cache 上传；跨 runner 复用的是已安装依赖的构建层。导出 OCI 和远程缓存后清理本地 BuildKit 缓存，再保存 Release 分片。
+pip 缓存挂载只在当前 BuildKit 中复用，不作为 registry cache 上传；跨 runner 复用的是已安装依赖的构建层。导出 OCI 和远程层缓存后清理本地 BuildKit 缓存，再保存当前版本的不可变镜像缓存。
 
 修改 Dockerfile 或工作流后，需要提交、推送并发布指向新提交的新版本 Release；重跑旧运行仍使用旧版本锁定的源码与工作流，无法应用这些修改。
 
-发布日志逐个显示正在查询或上传的完整镜像标签，直接输出 Skopeo 的镜像层进度，并每 30 秒报告仍在上传的目标与耗时。远端标签查询限时 2 分钟；每次复制限时 30 分钟，期间由 Skopeo 最多重试 2 次。超时或失败会停止发布，固定标签全部成功前不会更新 `latest`。发布 job 总限时 120 分钟。重跑同一 Release 会复用已有的相同摘要标签与归档。
+发布日志逐个显示正在查询或上传的完整镜像标签，直接输出 Skopeo 的镜像层进度，并每 30 秒报告仍在上传的目标与耗时。远端标签查询限时 2 分钟；每次复制限时 30 分钟，期间由 Skopeo 最多重试 2 次。超时或失败会停止发布，固定标签全部成功前不会更新 `latest`。发布 job 总限时 120 分钟。重跑同一 Release 会复用已有的相同摘要标签与 GHCR 缓存镜像。

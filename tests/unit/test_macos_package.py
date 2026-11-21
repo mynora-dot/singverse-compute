@@ -6,10 +6,9 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT/'scripts'))
@@ -27,7 +26,7 @@ installer = module('macos_install', ROOT/'scripts/macos-install.py')
 
 
 class MacosPackageTest(unittest.TestCase):
-    def test_archive_is_deterministic_excludes_private_data_and_runs_with_release_identity(self):
+    def test_dmg_payload_excludes_private_data_and_runs_with_release_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)/'source'
             root.mkdir()
@@ -44,17 +43,23 @@ class MacosPackageTest(unittest.TestCase):
                 path = root/name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('private-fixture')
-            archive, checksum = packager.package(root, Path(directory)/'one', '1.2.3', 'a'*40)
-            second, _ = packager.package(root, Path(directory)/'two', '1.2.3', 'a'*40)
-            self.assertEqual(archive.read_bytes(), second.read_bytes())
-            self.assertEqual(checksum.read_text(), hashlib.sha256(archive.read_bytes()).hexdigest()+'  '+archive.name+'\n')
             extracted = Path(directory)/'extracted'
-            with tarfile.open(archive) as source:
-                names = {member.name for member in source}
-                self.assertFalse(any(name.endswith(('.env', 'token', '.key', '.pth', '.pyc')) for name in names))
-                self.assertEqual(source.getmember(packager.FOLDER+'/Install.command').mode, 0o755)
-                source.extractall(extracted, filter='data')
+            def create_image(command, check):
+                self.assertTrue(check)
+                self.assertEqual(command[:2], ['hdiutil', 'create'])
+                self.assertEqual(command[command.index('-volname')+1], 'SingVerse Compute 1.2.3')
+                self.assertEqual(command[command.index('-format')+1], 'UDZO')
+                stage = Path(command[command.index('-srcfolder')+1])
+                shutil.copytree(stage, extracted)
+                Path(command[-1]).write_bytes(b'disk-image-fixture')
+            with patch.object(packager.subprocess, 'run', side_effect=create_image):
+                archive, checksum = packager.package(root, Path(directory)/'one', '1.2.3', 'a'*40)
+            self.assertEqual(archive.name, 'singverse-compute-macos-arm64-1.2.3.dmg')
+            self.assertEqual(checksum.read_text(), hashlib.sha256(archive.read_bytes()).hexdigest()+'  '+archive.name+'\n')
             project = extracted/packager.FOLDER
+            names = {str(path.relative_to(project)) for path in project.rglob('*')}
+            self.assertFalse(any(name.endswith(('.env', 'token', '.key', '.pth', '.pyc')) for name in names))
+            self.assertEqual((project/'Install.command').stat().st_mode & 0o777, 0o755)
             metadata = json.loads((project/'singverse_compute/core/build.json').read_text())
             self.assertEqual((metadata['version'], metadata['revision'], metadata['variant']), ('1.2.3', 'a'*40, 'macos'))
             subprocess.run([sys.executable, '-c', "from singverse_compute.core.build_info import build_info, includes_backend; "
@@ -63,6 +68,21 @@ class MacosPackageTest(unittest.TestCase):
                            cwd=project, env={key: value for key, value in os.environ.items() if not key.startswith('SINGVERSE_')}, check=True)
             for label in ('Install', 'Start', 'Stop'):
                 subprocess.run(['sh', '-n', str(project/(label+'.command'))], check=True)
+
+    def test_release_retry_reuses_first_image_and_recovers_its_checksum(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)/'dist'
+            assets = Mock()
+            assets.lookup.return_value = {'id': 42}
+            assets.download.side_effect = lambda repository, asset, target: target.write_bytes(b'first-dmg')
+            with patch.object(packager, 'package') as package:
+                image, checksum = packager.release_package(ROOT, output, '1.2.3', 'a'*40,
+                                                          assets, 'owner/repo', 'v1.2.3')
+            package.assert_not_called()
+            self.assertEqual(image.read_bytes(), b'first-dmg')
+            self.assertEqual(checksum.read_text(), hashlib.sha256(b'first-dmg').hexdigest()+'  '+image.name+'\n')
+            self.assertEqual([call.args[2] for call in assets.save_file.call_args_list],
+                             [image.name, checksum.name])
 
     def test_non_release_versions_and_non_commit_revisions_are_rejected(self):
         for version, revision in [('1.2.3-rc.1', 'a'*40), ('1.2.3', 'main'), ('1.2.3', 'a'*40+'\n')]:

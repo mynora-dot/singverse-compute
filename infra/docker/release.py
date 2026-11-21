@@ -131,9 +131,9 @@ def layout(directory, variant, raw, destination):
 
 
 @contextmanager
-def variant_artifacts(directory, variant, from_release):
-    """Keep only one runtime's archives on disk while publishing a Release."""
-    if not from_release:
+def variant_artifacts(directory, variant, from_registry):
+    """Keep only one runtime's archives on disk while publishing from GHCR."""
+    if not from_registry:
         yield directory
         return
     with tempfile.TemporaryDirectory(prefix='singverse-archives-') as temporary:
@@ -141,15 +141,15 @@ def variant_artifacts(directory, variant, from_release):
         for arch in VARIANTS[variant]:
             name = f'{variant}-{arch}'
             archive = source / name / 'image.tar'
-            print('Restoring Release archive: ' + name, flush=True)
+            print('Restoring registry archive: ' + name, flush=True)
             subprocess.run([sys.executable, str(ROOT / 'infra/docker/release-artifact.py'),
                             'restore', '--name', name + '.oci.tar', '--archive', str(archive)], check=True)
             if not archive.is_file():
-                raise ValueError('Missing immutable Release archive: ' + name)
+                raise ValueError('Missing immutable registry archive: ' + name)
         yield source
 
 
-def publish(directory, from_release=False):
+def publish(directory, from_registry=False):
     version, prefixes = config()
     records = []
     # Finish each runtime's immutable tags before releasing its local archives.
@@ -157,7 +157,7 @@ def publish(directory, from_release=False):
         image = 'singverse-compute'
         suffix = '-' + variant
         print('Publishing runtime: ' + variant, flush=True)
-        with variant_artifacts(directory, variant, from_release) as source:
+        with variant_artifacts(directory, variant, from_registry) as source:
             entries = []
             for arch in arches:
                 archive = source / f'{variant}-{arch}' / 'image.tar'
@@ -191,12 +191,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('validate', 'publish'))
     parser.add_argument('--artifacts', type=Path, default=Path('artifacts'))
-    parser.add_argument('--from-release', action='store_true',
-                        help='Restore and clean up one runtime at a time from immutable Release assets')
+    parser.add_argument('--from-registry', action='store_true',
+                        help='Restore and clean up one runtime at a time from the immutable GHCR cache')
     args = parser.parse_args()
     version, _ = config()
     if args.command == 'publish':
-        publish(args.artifacts, from_release=args.from_release)
+        publish(args.artifacts, from_registry=args.from_registry)
     print('Validated release ' + version)
 
 

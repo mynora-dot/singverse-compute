@@ -1,16 +1,19 @@
 # Mac 原生计算节点
 
-GitHub 正式 Release 同时提供 `singverse-compute-macos-arm64-<版本>.tar.gz` 和同名 `.sha256`，适用于 Apple Silicon（M1 及后续芯片）的 macOS 原生节点。版本与提交由同一 Release 注入，不需要新增 GitHub Variables 或 Secrets。Mac 包独立于四种 Linux Docker 镜像，使用 MPS、MLX 与 VideoToolbox；CPU 只作为 AI 加速不可用或执行失败后的自动降级。
+GitHub 正式 Release 同时提供 `singverse-compute-macos-arm64-<版本>.dmg` 和同名 `.sha256`，适用于 Apple Silicon（M1 及后续芯片）的 macOS 原生节点。版本与提交由同一 Release 注入，不需要新增 GitHub Variables 或 Secrets。Mac 包独立于四种 Linux Docker 镜像，使用 MPS、MLX 与 VideoToolbox；CPU 只作为 AI 加速不可用或执行失败后的自动降级。
 
 这是带安装入口的原生 Python 分发包，首次安装需联网下载锁定的依赖和 FFmpeg；不内置 Python、模型权重或宿主驱动。先安装原生 ARM64 Python 3.12（命令 `python3.12`），不要使用 Rosetta 的 x86_64 Python。安装目录中会生成项目自己的三个虚拟环境与 `.tools`，不会安装全局 Python 包。
 
-下载归档及校验文件到同一目录，先校验、再解压：
+下载 DMG 及校验文件到同一目录，先校验，再打开磁盘映像。把其中的 `singverse-compute-macos` 文件夹复制到自己的可写目录（例如 `~/Applications`），弹出磁盘映像后安装；不要在只读映像中运行安装入口。也可使用命令：
 
 ```sh
 # 将文件名中的 <版本> 替换成实际 Release 数字版本
-shasum -a 256 -c singverse-compute-macos-arm64-<版本>.tar.gz.sha256
-tar -xzf singverse-compute-macos-arm64-<版本>.tar.gz
-cd singverse-compute-macos
+shasum -a 256 -c singverse-compute-macos-arm64-<版本>.dmg.sha256
+hdiutil attach singverse-compute-macos-arm64-<版本>.dmg
+mkdir -p ~/Applications
+cp -R "/Volumes/SingVerse Compute <版本>/singverse-compute-macos" ~/Applications/
+hdiutil detach "/Volumes/SingVerse Compute <版本>"
+cd ~/Applications/singverse-compute-macos
 sh Install.command
 sh Start.command
 ```

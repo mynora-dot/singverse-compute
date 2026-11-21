@@ -40,7 +40,7 @@ jobs:
   macos:
     if: needs.preflight.outputs.publish == 'true'
     needs: preflight
-    runs-on: ubuntu-24.04
+    runs-on: macos-15
     timeout-minutes: 10
     permissions:
       contents: write
@@ -53,12 +53,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.preflight.outputs.revision }}
-      - name: Package the native Apple Silicon installer and publish immutable assets
+      - name: Package the native Apple Silicon DMG and publish immutable assets
         run: python3 scripts/package-macos.py --publish
   build:
+    if: needs.preflight.outputs.publish == 'true'
     needs: preflight
     permissions:
-      contents: write
+      contents: read
       packages: write
     env:
       GH_TOKEN: ${{ github.token }}
@@ -66,6 +67,8 @@ jobs:
       SINGVERSE_VERSION: ${{ needs.preflight.outputs.version }}
       RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
       GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE }}
+      GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
     strategy:
       fail-fast: false
       matrix:
@@ -82,17 +85,21 @@ jobs:
           ref: ${{ needs.preflight.outputs.revision }}
       - name: Make room for accelerator runtimes and OCI exports
         run: bash infra/docker/prepare-runner.sh
-      - name: Restore the immutable release archive for retries
+      - name: Use the preinstalled registry copy tool
+        run: |
+          if ! command -v skopeo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends skopeo
+          fi
+      - name: Authenticate the release and build caches
+        run: |
+          printf '%s' "$GHCR_TOKEN" | skopeo login ghcr.io --username "$GHCR_USERNAME" --password-stdin
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USERNAME" --password-stdin
+      - name: Restore the immutable registry archive for retries
         id: cached
         run: python3 infra/docker/release-artifact.py restore --name '${{ matrix.variant }}-${{ matrix.arch }}.oci.tar'
       - uses: docker/setup-buildx-action@v3
         if: steps.cached.outputs.found != 'true'
-      - name: Authenticate the shared build cache
-        if: steps.cached.outputs.found != 'true'
-        env:
-          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
-        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USERNAME" --password-stdin
       - name: Build runtime release archive
         if: steps.cached.outputs.found != 'true'
         env:
@@ -115,8 +122,8 @@ jobs:
         run: |
           docker buildx prune --all --force
           df -h /
-      - name: Preserve release archive for publish retries
-        if: needs.preflight.outputs.publish == 'true' && steps.cached.outputs.found != 'true'
+      - name: Preserve registry archive for publish retries
+        if: steps.cached.outputs.found != 'true'
         run: python3 infra/docker/release-artifact.py save --name '${{ matrix.variant }}-${{ matrix.arch }}.oci.tar'
 
   publish:
@@ -129,6 +136,7 @@ jobs:
       packages: write
     env:
       GH_TOKEN: ${{ github.token }}
+      SOURCE_REVISION: ${{ needs.preflight.outputs.revision }}
       RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
       SINGVERSE_VERSION: ${{ needs.preflight.outputs.version }}
       GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE }}
@@ -154,4 +162,4 @@ jobs:
           printf '%s' "$GHCR_TOKEN" | skopeo login ghcr.io --username "$GHCR_USERNAME" --password-stdin
           printf '%s' "$DOCKERHUB_TOKEN" | skopeo login docker.io --username "$DOCKERHUB_USERNAME" --password-stdin
       - name: Publish identical immutable artifacts, then update latest
-        run: python3 -u infra/docker/release.py publish --from-release
+        run: python3 -u infra/docker/release.py publish --from-registry

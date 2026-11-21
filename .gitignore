@@ -159,3 +159,10 @@ test-output/
 
 # Personal agent skills are maintained outside this repository.
 /skills/
+
+# Local release credentials and private artifacts
+/.docker/
+/.config/gh/
+/.gh/
+/.private-release/
+credentials.*.json

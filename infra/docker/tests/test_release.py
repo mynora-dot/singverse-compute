@@ -111,7 +111,7 @@ class ReleaseTests(unittest.TestCase):
                 release.publish(Path('/unused'))
             copy.assert_not_called()
 
-    def test_release_archives_are_bounded_to_one_runtime_and_cleaned_before_latest(self):
+    def test_registry_archives_are_bounded_to_one_runtime_and_cleaned_before_latest(self):
         raw = json.dumps({'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.manifest.v1+json'}).encode()
         roots = []
         restored = []
@@ -144,14 +144,14 @@ class ReleaseTests(unittest.TestCase):
              patch.object(release.subprocess, 'check_output', return_value=raw), \
              patch.object(release, 'ensure', side_effect=lambda ref, digest, publish: events.append(('fixed', ref))), \
              patch.object(release, 'layout', side_effect=layout), patch.object(release, 'copy_image', side_effect=copy):
-            release.publish(Path('/unused'), from_release=True)
+            release.publish(Path('/unused'), from_registry=True)
 
         self.assertEqual(restored, ['cuda-amd64', 'cuda-arm64', 'rocm-amd64'])
         self.assertEqual(len(roots), 2)
         self.assertEqual([event[0] for event in events], ['fixed'] * 4 + ['latest'] * 4)
         self.assertTrue(all(not root.exists() for root in roots))
 
-    def test_missing_release_archive_stops_publishing_and_cleans_downloads(self):
+    def test_missing_registry_archive_stops_publishing_and_cleans_downloads(self):
         roots = []
 
         def restore(args, check):
@@ -161,8 +161,8 @@ class ReleaseTests(unittest.TestCase):
 
         with patch.dict(release.os.environ, self.env(), clear=True), \
              patch.object(release.subprocess, 'run', side_effect=restore), patch.object(release, 'ensure') as publish:
-            with self.assertRaisesRegex(ValueError, 'Missing immutable Release archive'):
-                release.publish(Path('/unused'), from_release=True)
+            with self.assertRaisesRegex(ValueError, 'Missing immutable registry archive'):
+                release.publish(Path('/unused'), from_registry=True)
         publish.assert_not_called()
         self.assertTrue(all(not root.exists() for root in roots))
 
@@ -180,7 +180,7 @@ class ReleaseTests(unittest.TestCase):
              patch.object(release.subprocess, 'run', side_effect=restore) as commands, \
              patch.object(release, 'ensure') as publish:
             with self.assertRaises(subprocess.CalledProcessError):
-                release.publish(Path('/unused'), from_release=True)
+                release.publish(Path('/unused'), from_registry=True)
         commands.assert_called_once()
         publish.assert_not_called()
         self.assertTrue(all(not root.exists() for root in roots))
